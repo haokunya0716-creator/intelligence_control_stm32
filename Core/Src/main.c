@@ -63,7 +63,7 @@ uint8_t rx_byte_imu;   // 串口6接收陀螺仪数据
  */
 float duty_l = 0;
 float duty_r = 0;
-float angle_servo = 0;
+float angle_servo = 180.0f;
 int key1_flag = 0;
 /* USER CODE END PV */
 
@@ -131,8 +131,9 @@ int main(void)
   App_Speed_Init();
   App_Motor_Init();
 
-  App_Servo_init();//初始化舵机
+  App_Servo_Init();//初始化舵机
   HAL_UART_Receive_IT(&huart3, &rx_byte_imu, 1);//陀螺仪接收初始化
+
 
   /*
    * TIM1 以 1 MHz 计数并开启更新中断，供 gx_GetUs() 提供
@@ -167,6 +168,7 @@ int main(void)
     PERIODIC_START(KEY_DETECT,20)
     App_Button_Proc();
     PERIODIC_END
+
     PERIODIC_START(PEINT_USART,100)
     HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_14);
     PERIODIC_END

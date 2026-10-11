@@ -7,8 +7,18 @@
 
 #include "main.h"
 
-void App_Servo_init (void);
+typedef struct {
+    TIM_HandleTypeDef *htim;
+    uint32_t Channel;
+} Servo_t;
 
-void App_Servo_SetAngle(float angle);
+extern Servo_t servo_1; /* 夹爪：TIM5_CH2 / PA1 */
+extern Servo_t servo_2; /* 摄像头：TIM5_CH3 / PA2 */
+
+/* MX_TIM5_Init() 后调用一次，两路舵机均初始化为 180°。 */
+void App_Servo_Init(void);
+
+/* 初始化后调用；有限角度限制到 0～180°，无效指针、通道或非有限角度不写寄存器。 */
+void App_Servo_SetAngle(Servo_t *servo, float angle);
 
 #endif //INTELLIGENT_RESCUE_APP_SERVO_H

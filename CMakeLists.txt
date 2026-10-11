@@ -83,8 +83,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         User_gx/App_Motor/app_speed.c
         User_gx/App_Motor/app_speed.h
 
-        User_gx/App_servo/app_servo.c
-        User_gx/App_servo/app_servo.h
+        User_gx/App_Servo/app_servo.c
+        User_gx/App_Servo/app_servo.h
 
         User_gx/App_Protocol/rescue_protocol.c
         User_gx/App_Protocol/rescue_usart2.c
@@ -97,7 +97,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         User_gx/Inc
         User_gx/Src
         User_gx/App_Motor
-        User_gx/App_servo
+        User_gx/App_Servo
         User_gx/App_Protocol
         MyLib
         MyLib/Inc

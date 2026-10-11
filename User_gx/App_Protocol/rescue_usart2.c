@@ -234,11 +234,17 @@ static RescueAckResult Rescue_Usart2_Execute(const RescueFrame *frame)
         if (servo_deci_deg > 1800U) {
             return RESCUE_ACK_BAD_DATA;
         }
-        if (servo_category != RESCUE_SERVO_CATEGORY_1) {
-            /* 当前硬件驱动只连接了一个舵机；类别 2、3 保留扩展。 */
+        switch (servo_category) {
+        case RESCUE_SERVO_CATEGORY_1:
+            App_Servo_SetAngle(&servo_1, (float)servo_deci_deg / 10.0f);
+            break;
+        case RESCUE_SERVO_CATEGORY_2:
+            App_Servo_SetAngle(&servo_2, (float)servo_deci_deg / 10.0f);
+            break;
+        default:
+            /* 舵机 3 及其他类别尚未开放。 */
             return RESCUE_ACK_UNSUPPORTED;
         }
-        App_Servo_SetAngle((float)servo_deci_deg / 10.0f);
         last_valid_command_ms = HAL_GetTick();
         return RESCUE_ACK_ACCEPTED;
 

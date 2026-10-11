@@ -41,9 +41,9 @@ typedef enum {
 } RescueAckResult;
 
 typedef enum {
-    RESCUE_SERVO_CATEGORY_1 = 0x01,
-    RESCUE_SERVO_CATEGORY_2 = 0x02,
-    RESCUE_SERVO_CATEGORY_3 = 0x03
+    RESCUE_SERVO_CATEGORY_1 = 0x01, /* 夹爪：servo_1，TIM5_CH2 / PA1 */
+    RESCUE_SERVO_CATEGORY_2 = 0x02, /* 摄像头：servo_2，TIM5_CH3 / PA2 */
+    RESCUE_SERVO_CATEGORY_3 = 0x03  /* 保留，当前返回 UNSUPPORTED */
 } RescueServoCategory;
 
 /* CRC 校验和帧尾均通过后交给业务层的完整帧。 */
