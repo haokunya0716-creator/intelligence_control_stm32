@@ -12,10 +12,13 @@
 #define RESCUE_FRAME_HEAD_1       0x55U
 #define RESCUE_FRAME_TAIL_0       0x0DU
 #define RESCUE_FRAME_TAIL_1       0x0AU
-#define RESCUE_PROTOCOL_VERSION   0x01U
+#define RESCUE_PROTOCOL_VERSION   0x02U
 
 /* 数据长度由帧内 length 字段指定；该常量限制缓冲区大小。 */
-#define RESCUE_MAX_PAYLOAD        32U
+#define RESCUE_MAX_OBJECTS        20U
+#define RESCUE_SCENE_HEADER_SIZE  14U
+#define RESCUE_OBJECT_WIRE_SIZE   10U
+#define RESCUE_MAX_PAYLOAD        (RESCUE_SCENE_HEADER_SIZE + RESCUE_MAX_OBJECTS * RESCUE_OBJECT_WIRE_SIZE)
 #define RESCUE_FRAME_OVERHEAD     10U
 #define RESCUE_MAX_FRAME_SIZE     (RESCUE_FRAME_OVERHEAD + RESCUE_MAX_PAYLOAD)
 
@@ -24,27 +27,53 @@
  * 对应的长度检查和处理，不必改变通用帧结构。
  */
 typedef enum {
-    RESCUE_CMD_WHEEL_SPEED = 0x01, /* 左右轮速度闭环目标 */
-    RESCUE_CMD_ANGLE_RELATIVE = 0x02,/* 相对偏航角闭环目标 */
-    RESCUE_CMD_SERVO_ANGLE = 0x03, /* 指定舵机类别及目标角度 */
-    RESCUE_CMD_STOP = 0x04,        /* 立即停止左右轮 */
-    RESCUE_CMD_HEARTBEAT = 0x05,   /* 上位机在线心跳 */
-    RESCUE_CMD_ACK = 0x80          /* 下位机命令确认 */
+    RESCUE_CMD_HEARTBEAT = 0x05,    /* 相机 -> STM32：在线，不代表图像有效 */
+    RESCUE_CMD_OBSERVATIONS = 0x10, /* 相机 -> STM32：一幅图像的完整检测列表 */
+    RESCUE_CMD_VIEW_CONTEXT = 0x20 /* STM32 -> 相机：视角编号及舵机目标角 */
 } RescueCommand;
 
 typedef enum {
-    RESCUE_ACK_ACCEPTED = 0x00,    /* 已校验并接受，闭环仍在运行 */
-    RESCUE_ACK_UNSUPPORTED = 0x01, /* 命令或硬件类别当前不支持 */
-    RESCUE_ACK_BAD_DATA = 0x02,    /* 命令数据长度或取值错误 */
-    RESCUE_ACK_BUSY = 0x03,        /* 暂时无法执行 */
-    RESCUE_ACK_TX_ERROR = 0x04     /* 下位机 ACK 发送失败，仅本地统计可见 */
-} RescueAckResult;
+    RESCUE_OBJECT_UNKNOWN = 0,
+    RESCUE_OBJECT_SUPPLY = 1,       /* 绿色普通物资 */
+    RESCUE_OBJECT_CORE_SUPPLY = 2,  /* 黑色核心物资 */
+    RESCUE_OBJECT_CASUALTY = 3,     /* 橘色伤员 */
+    RESCUE_OBJECT_DANGER = 4,       /* 浅蓝危险物块 */
+    RESCUE_OBJECT_RED_SAFE_ZONE = 5,  /* 红方安全区整体，分区未知 */
+    RESCUE_OBJECT_BLUE_SAFE_ZONE = 6, /* 蓝方安全区整体，分区未知 */
+    RESCUE_OBJECT_START_ZONE = 7,
+    RESCUE_OBJECT_OBSTACLE = 8,
+    RESCUE_OBJECT_ROBOT = 9,
+    /* 分区单独上报；坐标和检测框对应分区本身，不是整个安全区。 */
+    RESCUE_OBJECT_RED_SUPPLY_ZONE = 10,    /* 红方物资放置区 */
+    RESCUE_OBJECT_RED_CASUALTY_ZONE = 11,  /* 红方伤员放置区 */
+    RESCUE_OBJECT_BLUE_SUPPLY_ZONE = 12,   /* 蓝方物资放置区 */
+    RESCUE_OBJECT_BLUE_CASUALTY_ZONE = 13  /* 蓝方伤员放置区 */
+} RescueObjectType;
 
-typedef enum {
-    RESCUE_SERVO_CATEGORY_1 = 0x01, /* 夹爪：servo_1，TIM5_CH2 / PA1 */
-    RESCUE_SERVO_CATEGORY_2 = 0x02, /* 摄像头：servo_2，TIM5_CH3 / PA2 */
-    RESCUE_SERVO_CATEGORY_3 = 0x03  /* 保留，当前返回 UNSUPPORTED */
-} RescueServoCategory;
+#define RESCUE_SCENE_IMAGE_VALID  0x01U
+#define RESCUE_SCENE_TRUNCATED    0x02U
+
+/* 列表下标仅在本帧有效；跨帧目标 ID 由 STM32 业务层维护。 */
+typedef struct {
+    uint8_t type;
+    uint8_t confidence; /* 0～100 */
+    uint16_t cx;        /* 像素坐标：左上角原点，x 向右，y 向下 */
+    uint16_t cy;
+    uint16_t width;
+    uint16_t height;
+} RescueObject;
+
+typedef struct {
+    uint16_t frame_id;
+    uint32_t capture_ms; /* 相机单调时钟，不可与 HAL_GetTick() 直接相减 */
+    uint16_t view_id;    /* 拍摄时生效的视角编号；0 为未设置 */
+    uint16_t image_width;
+    uint16_t image_height;
+    uint8_t flags;
+    uint8_t object_count;
+    RescueObject objects[RESCUE_MAX_OBJECTS];
+    uint32_t received_ms; /* STM32 收完串口帧的本地时间，不在线上传输 */
+} RescueScene;
 
 /* CRC 校验和帧尾均通过后交给业务层的完整帧。 */
 typedef struct {
@@ -80,5 +109,10 @@ int16_t Rescue_ReadI16(const uint8_t *data);
 uint16_t Rescue_ReadU16(const uint8_t *data);
 void Rescue_WriteI16(uint8_t *data, int16_t value);
 void Rescue_WriteU16(uint8_t *data, uint16_t value);
+uint32_t Rescue_ReadU32(const uint8_t *data);
+void Rescue_WriteU32(uint8_t *data, uint32_t value);
+
+/* 逐字段解码，禁止直接把 payload 强转成结构体；失败不改变 out。 */
+uint8_t Rescue_DecodeScene(const RescueFrame *frame, RescueScene *out);
 
 #endif

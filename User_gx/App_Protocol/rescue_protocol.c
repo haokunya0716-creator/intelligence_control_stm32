@@ -44,6 +44,68 @@ void Rescue_WriteU16(uint8_t *data, uint16_t value)
     data[1] = (uint8_t)(value >> 8);
 }
 
+uint32_t Rescue_ReadU32(const uint8_t *data)
+{
+    return (uint32_t)Rescue_ReadU16(data) |
+           ((uint32_t)Rescue_ReadU16(data + 2) << 16);
+}
+
+void Rescue_WriteU32(uint8_t *data, uint32_t value)
+{
+    Rescue_WriteU16(data, (uint16_t)value);
+    Rescue_WriteU16(data + 2, (uint16_t)(value >> 16));
+}
+
+uint8_t Rescue_DecodeScene(const RescueFrame *frame, RescueScene *out)
+{
+    RescueScene scene = {0};
+    uint8_t i;
+
+    if (frame == NULL || out == NULL ||
+        frame->command != RESCUE_CMD_OBSERVATIONS ||
+        frame->length < RESCUE_SCENE_HEADER_SIZE) {
+        return 0U;
+    }
+    scene.frame_id = Rescue_ReadU16(frame->payload);
+    scene.capture_ms = Rescue_ReadU32(frame->payload + 2);
+    scene.view_id = Rescue_ReadU16(frame->payload + 6);
+    scene.image_width = Rescue_ReadU16(frame->payload + 8);
+    scene.image_height = Rescue_ReadU16(frame->payload + 10);
+    scene.flags = frame->payload[12];
+    scene.object_count = frame->payload[13];
+    if (scene.object_count > RESCUE_MAX_OBJECTS ||
+        frame->length != RESCUE_SCENE_HEADER_SIZE +
+                         scene.object_count * RESCUE_OBJECT_WIRE_SIZE ||
+        scene.image_width == 0U || scene.image_height == 0U ||
+        (scene.flags & ~(RESCUE_SCENE_IMAGE_VALID | RESCUE_SCENE_TRUNCATED)) != 0U ||
+        ((scene.flags & RESCUE_SCENE_IMAGE_VALID) == 0U &&
+         (scene.object_count != 0U || scene.flags != 0U))) {
+        return 0U;
+    }
+    for (i = 0U; i < scene.object_count; ++i) {
+        const uint8_t *data = frame->payload + RESCUE_SCENE_HEADER_SIZE +
+                              i * RESCUE_OBJECT_WIRE_SIZE;
+        RescueObject *object = &scene.objects[i];
+        object->type = data[0];
+        object->confidence = data[1];
+        object->cx = Rescue_ReadU16(data + 2);
+        object->cy = Rescue_ReadU16(data + 4);
+        object->width = Rescue_ReadU16(data + 6);
+        object->height = Rescue_ReadU16(data + 8);
+        /* 中心定义为 xmin + width/2（整数向下取整），框须在图像内。 */
+        if (object->type > RESCUE_OBJECT_BLUE_CASUALTY_ZONE || object->confidence > 100U ||
+            object->width == 0U || object->height == 0U ||
+            object->width > scene.image_width || object->height > scene.image_height ||
+            object->cx < object->width / 2U || object->cy < object->height / 2U ||
+            (uint32_t)object->cx - object->width / 2U + object->width > scene.image_width ||
+            (uint32_t)object->cy - object->height / 2U + object->height > scene.image_height) {
+            return 0U;
+        }
+    }
+    *out = scene;
+    return 1U;
+}
+
 size_t Rescue_Encode(const RescueFrame *frame, uint8_t *output,
                      size_t capacity)
 {

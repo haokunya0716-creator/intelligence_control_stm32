@@ -33,8 +33,6 @@ enable_language(C ASM)
 
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME}
-        MyLib/DRV8701/drv8701.c
-        MyLib/DRV8701/drv8701.h
 
 
 )
@@ -88,6 +86,16 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
         User_gx/App_Protocol/rescue_protocol.c
         User_gx/App_Protocol/rescue_usart2.c
+
+        MyLib/DRV8701/drv8701.c
+        MyLib/DRV8701/drv8701.h
+        App_Task/App_Task.c
+        App_Task/App_Task.h
+
+        User_gx/Oled_ssd/oled_hardware_i2c.c
+        User_gx/Oled_ssd/oled_hardware_i2c.h
+        User_gx/Oled_ssd/oledfont.h
+
 )
 
 # Add include paths
@@ -103,6 +111,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         MyLib/Inc
         MyLib/Src
         MyLib/DRV8701
+        App_Task
+         User_gx/Oled_ssd
 )
 
 # Add project symbols (macros)

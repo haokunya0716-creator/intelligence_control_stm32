@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "tim.h"
 #include "usart.h"
 #include "usb_device.h"
@@ -37,6 +38,9 @@
 #include "app_speed.h"
 #include "JY901S.h"
 #include "rescue_usart2.h"
+#include "App_Task.h"
+#include "oled_hardware_i2c.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,8 +67,11 @@ uint8_t rx_byte_imu;   // 串口6接收陀螺仪数据
  */
 float duty_l = 0;
 float duty_r = 0;
-float angle_servo = 180.0f;
+float angle_1 = 0.0f;
+float angle_2 = 0.0f;
 int key1_flag = 0;
+int key2_flag = 0; // 预留，与现有按键 2 回调对应
+int key3_flag = 0; // 预留，与现有按键 3 回调对应
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,6 +124,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_TIM5_Init();
   MX_TIM4_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
   /*
@@ -127,12 +135,16 @@ int main(void)
   Motor_Init();
   Motor_Cmd(1);
 
-  /* 协议服务按收到的命令选择速度闭环或偏航角闭环。 */
+  /* 控制目标和闭环模式由 STM32 本地业务层选择，视觉串口只提供场景。 */
   App_Speed_Init();
   App_Motor_Init();
 
   App_Servo_Init();//初始化舵机
+  App_Button_Init();//初始化按键及 key1_flag 对应的单击回调
   HAL_UART_Receive_IT(&huart3, &rx_byte_imu, 1);//陀螺仪接收初始化
+
+  OLED_Init();//oled初始化并且显示信息
+  OLED_ShowString(0, 0, (uint8_t *)"angle", 8);
 
 
   /*
@@ -159,12 +171,10 @@ int main(void)
   while (1)
   {
     if (key1_flag == 1) {
-      /*
-       * 这里来放开始的时候要执行的代码
-       */
       key1_flag = 0;
+      App_Task_Start(); // 启动本地运行流程，执行期间再次按下不会重复启动
     }
-    //App_Usart_USB_Process();
+    App_Usart_USB_Process();
     PERIODIC_START(KEY_DETECT,20)
     App_Button_Proc();
     PERIODIC_END
@@ -173,23 +183,39 @@ int main(void)
     HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_14);
     PERIODIC_END
 
+    /* oled
+     * 每 100 ms 显示偏航角，并检查两路舵机的设定角度。
+     * 6×8 小字体每行占一页：偏航角 y=1，夹爪 y=2，摄像头 y=3。
+     */
+    PERIODIC_START(ANGLE_OLED, 100)
+    float yaw;
+    char text[24];
+    // 只读取偏航角，单位：度
+    IMU_GetAnglesSnapshot(NULL, NULL, &yaw);
+    // 固定宽度，保留两位小数，例如 Yaw: +90.25
+    snprintf(text, sizeof(text), "Yaw:%+7.2f", (double)yaw);
+    OLED_ShowString(0, 1, (uint8_t *)text, 8);
 
-    /* 处理 USART2 命令，并运行当前命令选中的速度环或角度环。 */
+    // 初值 -1 保证第一次进入就显示；之后仅在角度变化时重绘，减少 I2C 传输。
+    static float last_servo1_angle = -1.0f;
+    static float last_servo2_angle = -1.0f;
+    if(servo_1.Angle != last_servo1_angle){
+      snprintf(text, sizeof(text), "Servo1:%5.1f deg", (double)servo_1.Angle);
+      OLED_ShowString(0, 2, (uint8_t *)text, 8); // 舵机 1：夹爪
+      last_servo1_angle = servo_1.Angle;
+    }
+    if(servo_2.Angle != last_servo2_angle){
+      snprintf(text, sizeof(text), "Servo2:%5.1f deg", (double)servo_2.Angle);
+      OLED_ShowString(0, 3, (uint8_t *)text, 8); // 舵机 2：摄像头
+      last_servo2_angle = servo_2.Angle;
+    }
+    PERIODIC_END
+
+
+    /* 先更新视觉场景，再执行本地任务和当前步骤需要的控制闭环。 */
     Rescue_Usart2_Process();
-    // PERIODIC_START(PEINT_USART,15)
-    // App_USART1_Printf("%.3f,%.3f\n",
-    //                   angle_yaw_omega_ref,
-    //                   angle_yaw_omega);
+    App_Task_Proc();
 
-    // Motor_Set_L(duty_l);
-    // Motor_Set_R(duty_l);
-    // App_USART1_Printf("%.3f\n",
-    //                  gyroZRate);
-
-    // App_USART1_Printf("%.3f,%.3f\n",
-    //                   encoder_l_pos,
-    //                   encoder_r_pos);
-    //PERIODIC_END
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
