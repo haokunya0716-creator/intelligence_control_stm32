@@ -29,8 +29,11 @@ void Set_Position_SP(float position_ref);
 /* 同时设置相对位移目标和相对角度目标。 */
 void Set_Position_Angle_SP(float position_ref, float angle_ref);
 
-/* 执行角度环控制，并驱动小车原地转向。 */
+/* 执行角度环原地转向；连续计算剩余角度，避免180°附近反复换向。 */
 void App_Angle_Pro(void);
+
+/* 任务转向使用可调到位容差和最小单轮速度，避免小误差时输出不足以克服摩擦。 */
+void App_Angle_Pro_Limited(float tolerance_deg, float min_speed);
 
 /* 执行位置环和角度环联合控制。 */
 void App_Position_Pro(void);

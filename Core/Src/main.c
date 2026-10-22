@@ -36,9 +36,11 @@
 #include "app_servo.h"
 #include "app_motor.h"
 #include "app_speed.h"
+#include "app_line_pid.h"
 #include "JY901S.h"
 #include "rescue_usart2.h"
 #include "App_Task.h"
+#include "app_task_config.h"
 #include "oled_hardware_i2c.h"
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -69,9 +71,9 @@ float duty_l = 0;
 float duty_r = 0;
 float angle_1 = 0.0f;
 float angle_2 = 0.0f;
-int key1_flag = 0;
-int key2_flag = 0; // 预留，与现有按键 2 回调对应
-int key3_flag = 0; // 预留，与现有按键 3 回调对应
+extern int key1_flag;//调试按键，不启动任务
+extern int key2_flag;//蓝方任务启动
+extern int key3_flag;//红方任务启动
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -138,13 +140,14 @@ int main(void)
   /* 控制目标和闭环模式由 STM32 本地业务层选择，视觉串口只提供场景。 */
   App_Speed_Init();
   App_Motor_Init();
+  App_LinePID_Init(); // 视觉对准 PID 初始化，SP 为屏幕中心 x
 
   App_Servo_Init();//初始化舵机
-  App_Button_Init();//初始化按键及 key1_flag 对应的单击回调
+  App_Button_Init();//初始化三个按键的单击回调：KEY2蓝方、KEY3红方
   HAL_UART_Receive_IT(&huart3, &rx_byte_imu, 1);//陀螺仪接收初始化
 
-  OLED_Init();//oled初始化并且显示信息
-  OLED_ShowString(0, 0, (uint8_t *)"angle", 8);
+  // OLED_Init();//oled初始化并且显示信息
+  // OLED_ShowString(0, 0, (uint8_t *)"angle", 8);
 
 
   /*
@@ -162,7 +165,7 @@ int main(void)
     Error_Handler();
   }
   App_USART1_Printf("start!\n");
-
+  //App_USART2_Printf("start!\n");
 
   /* USER CODE END 2 */
 
@@ -170,51 +173,30 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    if (key1_flag == 1) {
-      key1_flag = 0;
-      App_Task_Start(); // 启动本地运行流程，执行期间再次按下不会重复启动
+    if (key2_flag == 1 || key3_flag == 1) {
+      uint8_t team = key3_flag == 1 ? APP_TASK_TEAM_RED : APP_TASK_TEAM_BLUE;
+      key2_flag = 0;
+      key3_flag = 0;
+      App_Task_Start(team);
     }
-    App_Usart_USB_Process();
+    App_Usart_USB_Process();//USB虚拟串口通信
     PERIODIC_START(KEY_DETECT,20)
     App_Button_Proc();
     PERIODIC_END
 
-    PERIODIC_START(PEINT_USART,100)
-    HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_14);
+    PERIODIC_START(PEINT_USART,500)
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
     PERIODIC_END
 
     /* oled
      * 每 100 ms 显示偏航角，并检查两路舵机的设定角度。
      * 6×8 小字体每行占一页：偏航角 y=1，夹爪 y=2，摄像头 y=3。
      */
-    PERIODIC_START(ANGLE_OLED, 100)
-    float yaw;
-    char text[24];
-    // 只读取偏航角，单位：度
-    IMU_GetAnglesSnapshot(NULL, NULL, &yaw);
-    // 固定宽度，保留两位小数，例如 Yaw: +90.25
-    snprintf(text, sizeof(text), "Yaw:%+7.2f", (double)yaw);
-    OLED_ShowString(0, 1, (uint8_t *)text, 8);
-
-    // 初值 -1 保证第一次进入就显示；之后仅在角度变化时重绘，减少 I2C 传输。
-    static float last_servo1_angle = -1.0f;
-    static float last_servo2_angle = -1.0f;
-    if(servo_1.Angle != last_servo1_angle){
-      snprintf(text, sizeof(text), "Servo1:%5.1f deg", (double)servo_1.Angle);
-      OLED_ShowString(0, 2, (uint8_t *)text, 8); // 舵机 1：夹爪
-      last_servo1_angle = servo_1.Angle;
-    }
-    if(servo_2.Angle != last_servo2_angle){
-      snprintf(text, sizeof(text), "Servo2:%5.1f deg", (double)servo_2.Angle);
-      OLED_ShowString(0, 3, (uint8_t *)text, 8); // 舵机 2：摄像头
-      last_servo2_angle = servo_2.Angle;
-    }
-    PERIODIC_END
-
 
     /* 先更新视觉场景，再执行本地任务和当前步骤需要的控制闭环。 */
     Rescue_Usart2_Process();
     App_Task_Proc();
+    Rescue_Usart2_Debug_Proc(); // 正式模式下串口1报告相机断流超时。
 
     /* USER CODE END WHILE */
 

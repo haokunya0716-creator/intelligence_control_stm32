@@ -16,7 +16,7 @@ typedef struct {
 extern Servo_t servo_1; /* 夹爪：TIM5_CH2 / PA1 */
 extern Servo_t servo_2; /* 摄像头：TIM5_CH3 / PA2 */
 
-/* MX_TIM5_Init() 后调用一次，两路舵机均初始化为 180°。 */
+/* MX_TIM5_Init()后调用一次，前框初始化180°、摄像头75°。 */
 void App_Servo_Init(void);
 
 /* 初始化后调用；角度限幅到 0～180°，写入 PWM 后同步更新 servo->Angle。

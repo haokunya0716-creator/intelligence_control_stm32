@@ -1,5 +1,6 @@
 #include "rescue_usart2.h"
 
+#include "app_usart.h"
 #include "usart.h"
 
 #define RESCUE_RX_QUEUE_SIZE        4U
@@ -21,11 +22,13 @@ static volatile uint8_t rx_active;
 static volatile uint32_t dropped_count;
 static volatile uint32_t parse_error_count;
 static uint32_t bad_data_count;
-static uint32_t last_byte_ms;
+static volatile uint32_t last_byte_ms; // 接收中断逐字节更新，主循环据此判断断流，不依赖解析结果。
 static uint32_t last_link_ms;
 static uint8_t link_seen;
 static RescueScene latest_scene;
 static uint8_t scene_seen;
+
+static uint8_t debug_timeout_reported; // 一次断流只报告一次，恢复收到字节后允许再次报告。
 
 uint8_t Rescue_Usart2_Start(void)
 {
@@ -41,6 +44,7 @@ uint8_t Rescue_Usart2_Start(void)
     bad_data_count = 0U;
     link_seen = 0U;
     scene_seen = 0U;
+    debug_timeout_reported = 0U;
     last_byte_ms = HAL_GetTick();
     last_link_ms = last_byte_ms;
     if (HAL_UART_Receive_IT(&huart2, &rx_byte, 1U) != HAL_OK) {
@@ -147,6 +151,7 @@ void Rescue_Usart2_Process(void)
         }
         switch (received.frame.command) {
         case RESCUE_CMD_OBSERVATIONS:
+        case RESCUE_CMD_OBSERVATIONS_EXT:
             if (Rescue_DecodeScene(&received.frame, &scene) == 0U) {
                 bad_data_count++;
                 break;
@@ -180,6 +185,26 @@ void Rescue_Usart2_Process(void)
             break;
         }
     }
+}
+
+// @简介：主循环检查串口2断流，仅通过串口1报告接收超时，不打印相机内容。
+// @说明：连续10秒无任何字节时报告一次uart_error；收到任意字节后重新计时。
+void Rescue_Usart2_Debug_Proc(void)
+{
+    uint32_t last_rx_ms = last_byte_ms; // 先读接收时间再取当前时间，避免中断更新产生“未来时间”。
+    uint32_t now_ms = HAL_GetTick();
+
+    if (RESCUE_DEBUG_ENABLE == 0U) {
+        return;
+    }
+    if ((uint32_t)(now_ms - last_rx_ms) >= RESCUE_RX_TIMEOUT_MS) {
+        if (debug_timeout_reported == 0U) {
+            App_USART1_Printf("uart_error\r\n");
+            debug_timeout_reported = 1U;
+        }
+        return;
+    }
+    debug_timeout_reported = 0U; // 已恢复接收，允许下次断流时再次报告。
 }
 
 uint8_t Rescue_Usart2_GetScene(RescueScene *out)

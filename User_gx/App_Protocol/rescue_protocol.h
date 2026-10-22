@@ -18,7 +18,10 @@
 #define RESCUE_MAX_OBJECTS        20U
 #define RESCUE_SCENE_HEADER_SIZE  14U
 #define RESCUE_OBJECT_WIRE_SIZE   10U
-#define RESCUE_MAX_PAYLOAD        (RESCUE_SCENE_HEADER_SIZE + RESCUE_MAX_OBJECTS * RESCUE_OBJECT_WIRE_SIZE)
+#define RESCUE_EXT_HEADER_SIZE    16U /* 原14字节图像头后追加source_age_ms:uint16 */
+#define RESCUE_EXT_OBJECT_SIZE    12U /* 原10字节条目后追加track_id:uint16，0表示无ID */
+#define RESCUE_EXT_MAX_OBJECTS    19U /* 16+19*12=244；加10字节外壳后254，适配uint8解析器 */
+#define RESCUE_MAX_PAYLOAD        (RESCUE_EXT_HEADER_SIZE + RESCUE_EXT_MAX_OBJECTS * RESCUE_EXT_OBJECT_SIZE)
 #define RESCUE_FRAME_OVERHEAD     10U
 #define RESCUE_MAX_FRAME_SIZE     (RESCUE_FRAME_OVERHEAD + RESCUE_MAX_PAYLOAD)
 
@@ -29,6 +32,7 @@
 typedef enum {
     RESCUE_CMD_HEARTBEAT = 0x05,    /* 相机 -> STM32：在线，不代表图像有效 */
     RESCUE_CMD_OBSERVATIONS = 0x10, /* 相机 -> STM32：一幅图像的完整检测列表 */
+    RESCUE_CMD_OBSERVATIONS_EXT = 0x11, /* 可选扩展：采集至发送耗时及相机跟踪ID，兼容原0x10 */
     RESCUE_CMD_VIEW_CONTEXT = 0x20 /* STM32 -> 相机：视角编号及舵机目标角 */
 } RescueCommand;
 
@@ -53,7 +57,7 @@ typedef enum {
 #define RESCUE_SCENE_IMAGE_VALID  0x01U
 #define RESCUE_SCENE_TRUNCATED    0x02U
 
-/* 列表下标仅在本帧有效；跨帧目标 ID 由 STM32 业务层维护。 */
+/* 列表下标仅在本帧有效；相机ID可选，STM32仍检查类型、位置和尺寸。 */
 typedef struct {
     uint8_t type;
     uint8_t confidence; /* 0～100 */
@@ -61,6 +65,7 @@ typedef struct {
     uint16_t cy;
     uint16_t width;
     uint16_t height;
+    uint16_t track_id;  /* 扩展帧非零ID；同一视角内不可复用，普通帧为0 */
 } RescueObject;
 
 typedef struct {
@@ -71,6 +76,8 @@ typedef struct {
     uint16_t image_height;
     uint8_t flags;
     uint8_t object_count;
+    uint8_t has_source_age; /* 1=0x11有真实耗时；0=0x10缺失，不可当成零延迟 */
+    uint16_t source_age_ms; /* 相机本地：采集到准备发送的耗时，不与STM32时钟相减 */
     RescueObject objects[RESCUE_MAX_OBJECTS];
     uint32_t received_ms; /* STM32 收完串口帧的本地时间，不在线上传输 */
 } RescueScene;

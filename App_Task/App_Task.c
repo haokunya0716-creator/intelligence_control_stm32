@@ -2,444 +2,217 @@
 // Created by gaoxu on 2026/10/13.
 //
 
-#include "App_Task.h"
-#include "app_motor.h"
-#include "app_speed.h"
-#include "app_servo.h"
-#include "rescue_usart2.h"
+#include "App_Task.h" // 引入任务启动和状态机接口。
+#include "app_task_move.h" // 引入运动动作及统一结果类型。
+#include "app_task_vision.h" // 引入视觉选择、跟随和复检接口。
+#include "app_task_scatter.h" // 引入撞散前推及旋转接口。
+#include "app_usart.h" // 引入串口1格式化调试输出接口。
 
-typedef enum {
-    TASK_IDLE = 0,    // 等待按键
+typedef enum { // 定义任务状态枚举，状态机按下列步骤组织运行。
+    TASK_IDLE = 0,    // 停车等待按键
     TASK_FORWARD,     // 启动直行
-    TASK_TURN_RIGHT,
-    TASK_TURN_LEFT,
-    TASK_DETECT_RIGHT,
-    TASK_DETECT_LEFT,
-    TASK_RESELECT,    // 分离动作结束后，原地重新选目标
-    TASK_ALIGN,       // 先原地对准锁定的绿色物块
-    TASK_APPROACH,    // 边前进边对准
-    TASK_SCATTER,     // 停在准备距离，等待分离接口
-    TASK_EXECUTE      // 单独绿色已接近，后续转运留空
-} App_Task_State;
+    TASK_TURN_RIGHT, // 保留原状态编号；当前启动流程不再执行固定右转。
+    TASK_TURN_LEFT, // 保留原状态编号；当前启动流程不再执行180度换向。
+    TASK_SEARCH_SPIN, // 启动直行后持续原地旋转，并在旋转中搜索目标。
+    TASK_DETECT_LEFT, // 保留原状态编号；当前搜索不再分左右两侧。
+    TASK_RESELECT,    // 撞散结束后重新观察
+    TASK_FOLLOW,      // 首次对准+视觉PID接近，细节由视觉模块执行
+    TASK_SCATTER,     // 额外前推+限时原地旋转
+    TASK_FRAME_DROP, // 等待一号前框落下后再低头复检。
+    TASK_CAMERA_DROP, // 等待二号摄像头转到低头角度。
+    TASK_VERIFY,      // 低头复检框内恰好一个绿色
+    TASK_CAMERA_LIFT, // 等待摄像头恢复正常观察角。
+    TASK_CAPTURE_BACK, // 复检通过后按编码器行程后退。
+    TASK_ZONE_SEARCH, // 原地寻找本队物资放置区。
+    TASK_ZONE_FOLLOW, // 对准并接近锁定的本队物资放置区。
+    TASK_FRAME_LIFT, // 到达物资区停车门限后等待前框抬起。
+    TASK_RELEASE_BACK, // 抬框后按编码器行程退离物资区。
+    TASK_NEXT_CYCLE   // 新循环预留，不代表已确认首运得分
+} App_Task_State; // 将以上状态枚举命名为App_Task_State。
 
-static App_Task_State task_state = TASK_IDLE;
-static uint32_t task_time;          // 当前步骤开始时间，ms
-static uint32_t round_time;         // 本轮第一次按键时间，重试不重置
-static uint8_t round_started;
-static uint16_t view_id;
-static uint32_t view_time;
-static uint8_t view_sent;
-static RescueScene task_scene;     // 原始像素坐标，禁止当作厘米
-static RescueObject target;        // 上次匹配到的绿色物块，不保存列表下标
-static uint16_t target_image_w;
-static uint16_t target_image_h;
-static uint16_t last_frame_id;
-static uint32_t last_capture_ms;
-static uint8_t target_mixed;        // 0：单独接近，1：只走到分离准备距离
-static uint8_t correcting;          // 双门限死区的修正开关
+static App_Task_State task_state = TASK_IDLE; // 当前任务状态，程序启动时默认为停车等待。
+static uint32_t task_time;    // 当前任务步骤起点，ms；子动作自己维护内部计时
+static uint32_t round_time;   // 第一次按键起点，后续重试不延长整轮时间
+static uint8_t round_started; // 整轮是否已开始计时，静态初值为0；后续重试不清零。
+static uint8_t cargo_pending; // 落框后即使失败也保留，禁止按键盲目重启
 
-static float App_Task_Abs(float value)
-{
-    return value < 0.0f ? -value : value;
-}
+// @简介：切换任务步骤并记录开始时刻；只用于状态流转，不控制底层硬件。
+static void App_Task_Change(App_Task_State state) // 函数入口：切换任务步骤并记录开始时刻；只用于状态流转，不控制底层硬件。
+{ // 开始App_Task_Change函数体。
+    task_state = state; // 保存新任务状态，下次处理时执行对应分支。
+    task_time = HAL_GetTick(); // 记录该步骤开始的毫秒时刻，供等待及超时判断。
+    if(APP_TASK_DEBUG_ENABLE){ // 仅在开启任务调试宏时输出本次调试信息。
+        App_USART1_Printf("[TASK] state=%u\r\n", (unsigned int)state); // 通过串口1打印新状态编号，便于对应枚举观察流程。
+    } // 结束条件分支。
+} // 结束App_Task_Change函数体。
 
-// 换算到 640×480 做图像判断；task_scene 本身保持原始值。
-static float App_Task_X(const RescueObject *object)
-{
-    return object->cx * 640.0f / task_scene.image_width;
-}
+// @简介：结束本次任务并停车；不清除落框标志，异常载物需人工处理后复位。
+static void App_Task_Stop(void) // 函数入口：结束本次任务并停车；不清除落框标志，异常载物需人工处理后复位。
+{ // 开始App_Task_Stop函数体。
+    App_Task_Move_Stop(); // 撤销位置/角度控制并将左右轮目标速度置零。
+    App_Task_Change(TASK_IDLE); // 回到空闲等待状态，保留载物锁和整轮起点。
+} // 结束App_Task_Stop函数体。
 
-static float App_Task_Bottom(const RescueObject *object)
-{
-    return (object->cy - object->height / 2U + object->height) * 480.0f
-           / task_scene.image_height;
-}
+// @简介：停车后开始正常俯角的新视角检测；旧图像不能用于撞散后重选或搜索物资区。
+static void App_Task_BeginDetect(App_Task_State state) // 函数入口：停车后开始正常俯角的新视角检测；旧图像不能用于撞散后重选或搜索物资区。
+{ // 开始App_Task_BeginDetect函数体。
+    App_Task_Vision_Begin(SERVO2_LIFT); // 以正常俯角开始新视角，排除上一阶段迟到图像。
+    App_Task_Change(state); // 切换到指定检测状态，并记录本步骤起点。
+} // 结束App_Task_BeginDetect函数体。
 
-static void App_Task_Stop(void)
-{
-    App_Position_Angle_Reset();
-    App_Speed_Set(0.0f, 0.0f);
-    task_state = TASK_IDLE;
-}
+// @简介：空闲且未落框时选择队伍并启动；整轮三分钟计时只在第一次启动时开始。
+void App_Task_Start(uint8_t team) // 函数入口：空闲且未落框时选择队伍并启动；整轮三分钟计时只在第一次启动时开始。
+{ // 开始App_Task_Start函数体。
+    uint32_t now_ms = HAL_GetTick(); // 读取当前毫秒计时，作为本次处理的时间基准。
+    if(task_state != TASK_IDLE || cargo_pending != 0 // 非空闲或已经落框时拒绝重启，继续检查队伍是否合法。
+       || (team != APP_TASK_TEAM_RED && team != APP_TASK_TEAM_BLUE)){ return; } // 队伍参数也必须为红方或蓝方，否则立即返回。
+    if(round_started != 0 && (uint32_t)(now_ms - round_time) >= APP_TASK_ROUND_TIME_MS){ return; } // 本轮已经开始且达到总时限时禁止重新启动。
+    if(round_started == 0){ // 仅第一次接受启动时建立整轮计时起点。
+        round_started = 1; // 标记整轮已启动，后续重试不再重置起点。
+        round_time = now_ms; // 保存本轮首次启动的毫秒时间。
+    } // 结束条件分支。
+    App_Task_Move_Stop(); // 撤销位置/角度控制并将左右轮目标速度置零。
+    App_Task_Vision_Init(team); // 锁存队伍对应的物资区类型，复位视觉PID及用途标志。
+    App_Task_Frame_Set(0); // 命令前框抬起，搜索或退离时保持抬起。
+    App_Task_Camera_Set(0); // 命令摄像头恢复正常观察角度。
+    App_Task_Move_Speed(APP_TASK_FORWARD_SPEED, APP_TASK_FORWARD_SPEED); // 左右轮均下发启动轮速，正值前进，使用速度闭环。
+    App_Task_Change(TASK_FORWARD); // 进入启动直行状态，开始计算该段直行持续时间。
+} // 结束App_Task_Start函数体。
 
-// 大角度搜索/分离动作后更换编号，旧图像不能参与新一次选目标。
-static void App_Task_BeginDetect(App_Task_State state)
-{
-    App_Speed_Set(0.0f, 0.0f);
-    task_time = HAL_GetTick();
-    view_id++;
-    if(view_id == 0){
-        view_id = 1;
-    }
-    view_sent = 0;
-    task_state = state;
-}
+// @简介：非阻塞执行小车任务；只写步骤、条件与状态切换，具体动作调用封装函数。
+// @说明：任何阶段整轮到时均停车；落框后失败仍保留载物锁，不自动解锁后续救援。
+void App_Task_Proc(void) // 函数入口：非阻塞执行小车任务；只写步骤、条件与状态切换，具体动作调用封装函数。
+{ // 开始App_Task_Proc函数体。
+    App_Task_Result result; // 保存子动作的运行、等待、完成或失败结果。
+    uint32_t elapsed = (uint32_t)(HAL_GetTick() - task_time); // 用无符号时间差计算当前步骤已经持续的毫秒数。
+    if(round_started != 0 && (uint32_t)(HAL_GetTick() - round_time) >= APP_TASK_ROUND_TIME_MS){ // 整轮到达运行时限时，优先停止当前任务。
+        if(task_state != TASK_IDLE){ App_Task_Stop(); } // 若仍有任务在运行则停车并回到空闲状态。
+        return; // 结束本次调用，不再执行后续语句。
+    } // 结束条件分支。
+    switch(task_state){ // 根据当前状态执行一个非阻塞步骤。
+    case TASK_FORWARD: // 处理启动后的定时直行。
+        if(elapsed >= APP_TASK_FORWARD_TIME_MS){ // 直行时间达到宏定义门限后开始旋转搜索。
+            App_Task_BeginDetect(TASK_SEARCH_SPIN); // 停车并建立正常观察新视角，搜索状态随后开始旋转。
+        }else { // 前述条件不满足时执行此分支。
+            App_Task_Move_Proc(); // 维持当前目标轮速，继续执行左右轮速度闭环。
+        } // 结束其它情况分支。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-// 连续对准/接近不切换 view_id，靠新帧逐步关联；禁止移动摄像头。
-// 接收年龄不能反映相机推理积压，相机仍须及时采集/推理/发送。
-static uint8_t App_Task_ReadScene(void)
-{
-    return view_sent != 0 && Rescue_Usart2_GetScene(&task_scene) != 0
-           && task_scene.view_id == view_id
-           && task_scene.image_width != 0 && task_scene.image_height != 0
-           && (task_scene.flags & RESCUE_SCENE_IMAGE_VALID) != 0
-           && (uint32_t)(HAL_GetTick() - task_scene.received_ms) < APP_TASK_TRACK_MAX_AGE_MS
-           && App_Task_Abs(servo_2.Angle - SERVO2_LIFT) < 0.5f;
-}
+    case TASK_SEARCH_SPIN: { // 在原地持续旋转，并持续使用新图像搜索可跟踪目标。
+        int selected = App_Task_Vision_Select(); // 检查当前视角的有效新图像并尝试锁定绿色或可撞散物资目标。
+        if(selected > 0){ // 锁定成功后立即停止旋转，避免目标进入跟随时底盘仍在转动。
+            App_Task_Move_Stop(); // 撤销旋转速度并停车，视觉跟随从静止底盘开始。
+            App_Task_Change(TASK_FOLLOW); // 切换到首次横向对准和后续视觉跟踪。
+        }else { // 尚未锁定目标时继续缓慢原地旋转，等待相机看到合格目标。
+            App_Task_Move_Speed(APP_TASK_SEARCH_SPIN_SPEED, -APP_TASK_SEARCH_SPIN_SPEED); // 左轮前进、右轮后退，按配置速度顺时针搜索。
+        } // 结束目标锁定与持续搜索分支。
+        break; // 结束当前状态分支，等待下一次任务处理。
+    } // 结束原地搜索状态。
+    case TASK_RESELECT: { // 处理撞散后的重选，并为局部变量建立作用域。
+        int selected; // 保存目标选择结果：正数已锁定、零无候选、负数继续等待。
+        selected = elapsed >= APP_TASK_DETECT_TIMEOUT_MS ? 0 : App_Task_Vision_Select(); // 撞散后重选限时检查，其它时候按当前有效新图选目标。
+        if(selected > 0){ // 成功锁定合格目标时进入跟随流程。
+            App_Task_Change(TASK_FOLLOW); // 切换到首次对准和视觉差速接近状态。
+        }else if(selected == 0){ // 连续有效新帧无候选或检测超时，处理本侧无目标的情况。
+            App_Task_Stop(); // 撞散后重选超时仍无目标时停车结束。
+        } // 结束条件分支。
+        break; // 结束当前状态分支，等待下一次任务处理。
+    } // 结束检测状态局部作用域。
 
-// @返回：-1 不宜接近；0 与普通/核心物资拥挤；1 图像上单独且通道未见遮挡。
-// @说明：初版二维框判断不等于真实空间避障，遮挡物仍可能未被检测。
-// 未知物、伤员、危险物、机器人和安全区靠近目标时排除该目标。
-static int App_Task_CheckTarget(uint8_t index, uint8_t *neighbours)
-{
-    const RescueObject *object = &task_scene.objects[index];
-    float x = App_Task_X(object);
-    float bottom = App_Task_Bottom(object);
-    float path_left = (x < APP_TASK_AIM_X ? x : APP_TASK_AIM_X) - APP_TASK_PATH_HALF_WIDTH;
-    float path_right = (x > APP_TASK_AIM_X ? x : APP_TASK_AIM_X) + APP_TASK_PATH_HALF_WIDTH;
-    uint8_t i;
+    case TASK_FOLLOW: // 处理场地物块的首次对准、差速接近和到位复核。
+        result = App_Task_Vision_Follow(); // 执行原目标关联、首次对准、差速接近及到位停车复核。
+        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
+            if(App_Task_Vision_IsMixed()){ // 锁定用途为撞散时进入物资堆分支。
+                App_Task_Scatter_Start(); // 检查参数及场景条件后启动额外前推。
+                App_Task_Change(TASK_SCATTER); // 转入撞散状态，后续执行前推及限时旋转。
+            }else { // 前述条件不满足时执行此分支。
+                cargo_pending = 1; // 落框前设置载物锁；此后异常也禁止按键盲目重启。
+                App_Task_Frame_Set(1); // 单独绿色走到停车位置后才落框
+                App_Task_Change(TASK_FRAME_DROP); // 进入前框落下后的机械等待阶段。
+            } // 结束其它情况分支。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-    *neighbours = 0;
-    for(i = 0; i < task_scene.object_count; i++){
-        const RescueObject *other = &task_scene.objects[i];
-        float gap_x;
-        float gap_y;
-        float half_width;
-        float other_x;
+    case TASK_SCATTER: // 处理额外前推和原地旋转。
+        result = App_Task_Scatter_Proc(); // 非阻塞执行撞散子动作并取得其当前结果。
+        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
+            App_Task_BeginDetect(TASK_RESELECT); // 动作结束不等于撞散成功，重新选目标
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-        if(i == index || other->type == RESCUE_OBJECT_START_ZONE){
-            continue;
-        }
-        other_x = App_Task_X(other);
-        half_width = other->width * 320.0f / task_scene.image_width;
-        gap_x = App_Task_Abs(x - other_x)
-                - (object->width + other->width) * 320.0f / task_scene.image_width;
-        gap_y = (App_Task_Abs((float)object->cy - other->cy)
-                - (object->height + other->height) * 0.5f)
-                * 480.0f / task_scene.image_height;
-        if(gap_x < APP_TASK_ISOLATE_GAP_X && gap_y < APP_TASK_ISOLATE_GAP_Y){
-            if(other->type != RESCUE_OBJECT_SUPPLY && other->type != RESCUE_OBJECT_CORE_SUPPLY){
-                return -1;
-            }
-            (*neighbours)++;
-        }
-        // 目标前方的通道有其它框时不绕障，也不强行穿过物块堆。
-        if(App_Task_Bottom(other) > bottom + APP_TASK_PATH_DEPTH_MARGIN
-           && other_x + half_width >= path_left && other_x - half_width <= path_right){
-            return -1;
-        }
-    }
-    return *neighbours == 0 ? 1 : 0;
-}
+    case TASK_FRAME_DROP: // 等待前框落下稳定，再改变摄像头角度。
+        if(elapsed >= APP_TASK_SERVO_WAIT_MS){ // 舵机设定角发出后，等待配置的机械稳定时间。
+            App_Task_Camera_Set(1); // 命令摄像头低头观察前框内物体。
+            App_Task_Change(TASK_CAMERA_DROP); // 转入摄像头低头机械等待阶段。
+        } // 结束条件分支。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-// 优先单独绿色；都拥挤时优先邻居少的外围绿色。
-// 同级先看底边远近（固定俯角下的参考），再看转向幅度。
-// 非绿色永不成为目标；选定后不再每帧排名，避免在多个绿色间跳动。
-static uint8_t App_Task_SelectTarget(void)
-{
-    int best = -1;
-    uint8_t best_neighbours = 255;
-    uint8_t i;
+    case TASK_CAMERA_DROP: // 等待摄像头低头稳定后开始复检视角。
+        if(elapsed >= APP_TASK_SERVO_WAIT_MS){ // 舵机设定角发出后，等待配置的机械稳定时间。
+            App_Task_Vision_Begin(SERVO2_DROP); // 以低头俯角建立新的视角编号，拒绝正常俯角的旧图。
+            App_Task_Change(TASK_VERIFY); // 进入框内单绿色复检状态。
+        } // 结束条件分支。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-    for(i = 0; i < task_scene.object_count; i++){
-        const RescueObject *object = &task_scene.objects[i];
-        uint8_t neighbours;
-        float bottom = App_Task_Bottom(object);
+    case TASK_VERIFY: // 检查前框内是否连续新帧恰好一个完整绿色。
+        if(elapsed >= APP_TASK_VERIFY_TIMEOUT_MS){ App_Task_Stop(); break; } // 复检超过允许时间则停车并退出当前状态处理。
+        result = App_Task_Vision_Verify(); // 执行一次框内实体数量、类型和完整性复检。
+        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
+            App_Task_Camera_Set(0); // 命令摄像头恢复正常观察角度。
+            App_Task_Change(TASK_CAMERA_LIFT); // 复检通过后等待摄像头恢复正常观察角。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-        if(object->type != RESCUE_OBJECT_SUPPLY || object->confidence < APP_TASK_CONFIDENCE_MIN
-           || App_Task_CheckTarget(i, &neighbours) < 0){
-            continue;
-        }
-        if(best < 0 || neighbours < best_neighbours
-           || (neighbours == best_neighbours
-               && (bottom > App_Task_Bottom(&task_scene.objects[best])
-                   || (bottom == App_Task_Bottom(&task_scene.objects[best])
-                       && App_Task_Abs(App_Task_X(object) - APP_TASK_AIM_X)
-                          < App_Task_Abs(App_Task_X(&task_scene.objects[best]) - APP_TASK_AIM_X))))){
-            best = i;
-            best_neighbours = neighbours;
-        }
-    }
-    if(best < 0){
-        return 0;
-    }
-    target = task_scene.objects[best];
-    target_image_w = task_scene.image_width;
-    target_image_h = task_scene.image_height;
-    last_frame_id = task_scene.frame_id;
-    last_capture_ms = task_scene.capture_ms;
-    target_mixed = best_neighbours != 0;
-    correcting = 1;
-    task_time = HAL_GetTick();
-    task_state = TASK_ALIGN;
-    return 1;
-}
+    case TASK_CAMERA_LIFT: // 等待摄像头抬起稳定，再开始短距离后退。
+        if(elapsed >= APP_TASK_SERVO_WAIT_MS){ // 舵机设定角发出后，等待配置的机械稳定时间。
+            App_Task_Move_Start(-APP_TASK_CAPTURE_BACK_CM, APP_TASK_BACK_SPEED); // 按配置轮速启动短距离后退；负距离表示后退。
+            App_Task_Change(TASK_CAPTURE_BACK); // 进入复检后退状态，等待两轮均达到行程。
+        } // 结束条件分支。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-// 只在新图像上匹配：同类型、中心门限、尺寸变化不超过两倍。
-// 最近和次近候选太接近时拒绝，列表下标不是跨帧 ID。
-static int App_Task_MatchTarget(void)
-{
-    float best_score = APP_TASK_TRACK_GATE * APP_TASK_TRACK_GATE;
-    float second_score = 1.0e9f;
-    int best = -1;
-    uint8_t i;
+    case TASK_CAPTURE_BACK: // 处理复检通过后的编码器后退。
+        result = App_Task_Move_Distance(); // 根据两轮编码器行程执行直线运动并读取动作结果。
+        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
+            App_Task_BeginDetect(TASK_ZONE_SEARCH); // 后退完成后开始正常新视角，准备寻找本队物资区。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-    if(task_scene.image_width != target_image_w || task_scene.image_height != target_image_h){
-        return -1;
-    }
-    for(i = 0; i < task_scene.object_count; i++){
-        const RescueObject *object = &task_scene.objects[i];
-        float dx = ((float)object->cx - target.cx) * 640.0f / task_scene.image_width;
-        float dy = ((float)object->cy - target.cy) * 480.0f / task_scene.image_height;
-        float score = dx * dx + dy * dy;
+    case TASK_ZONE_SEARCH: // 限时原地寻找本队物资放置分区。
+        if(elapsed >= APP_TASK_ZONE_SEARCH_MS){ App_Task_Stop(); break; } // 物资区搜索超时则停车并退出当前状态。
+        result = App_Task_Vision_SearchZone(); // 旋转搜索唯一可信的本队物资分区，找到后锁定并停车。
+        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
+            App_Task_Change(TASK_ZONE_FOLLOW); // 进入物资区首次对准及差速接近状态。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-        if(object->type != RESCUE_OBJECT_SUPPLY || object->confidence < APP_TASK_CONFIDENCE_MIN
-           || object->width * 2U < target.width || object->width > target.width * 2U
-           || object->height * 2U < target.height || object->height > target.height * 2U
-           || score > APP_TASK_TRACK_GATE * APP_TASK_TRACK_GATE){
-            continue;
-        }
-        if(best < 0 || score < best_score){
-            second_score = best < 0 ? second_score : best_score;
-            best_score = score;
-            best = i;
-        }else if(score < second_score){
-            second_score = score;
-        }
-    }
-    if(second_score - best_score < APP_TASK_TRACK_AMBIGUITY * APP_TASK_TRACK_AMBIGUITY){
-        return -1;
-    }
-    return best;
-}
+    case TASK_ZONE_FOLLOW: // 对准并接近已锁定的本队物资分区。
+        result = App_Task_Vision_Follow(); // 执行原目标关联、首次对准、差速接近及到位停车复核。
+        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
+            App_Task_Frame_Set(0); // 到达物资区停车门限后抬框，退离后保持抬起
+            App_Task_Change(TASK_FRAME_LIFT); // 进入抬框机械等待阶段，等待完成后才退离。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-// 固定俯角地面近似：框底边 y = horizon + k / (前框距离 + 相机后退量)。
-// 两点实测求 horizon、k；只在标定区间内估算，不用框宽猜厘米。
-// 绿色框须完整且底边接地；裁切、遮挡、俯角改变均影响结果。
-static uint8_t App_Task_GetDistance(float *distance)
-{
-    float near_y = APP_TASK_RANGE_NEAR_Y;
-    float far_y = APP_TASK_RANGE_FAR_Y;
-    float near_cm = APP_TASK_RANGE_NEAR_CM + APP_TASK_CAMERA_FRONT_CM;
-    float far_cm = APP_TASK_RANGE_FAR_CM + APP_TASK_CAMERA_FRONT_CM;
-    float bottom = App_Task_Bottom(&target);
-    float k;
-    float horizon;
+    case TASK_FRAME_LIFT: // 等待前框抬起稳定后再后退。
+        if(elapsed >= APP_TASK_SERVO_WAIT_MS){ // 舵机设定角发出后，等待配置的机械稳定时间。
+            App_Task_Move_Start(-APP_TASK_RELEASE_BACK_CM, APP_TASK_BACK_SPEED); // 按配置速度启动卸下物块后的退离行程，负距离表示后退。
+            App_Task_Change(TASK_RELEASE_BACK); // 进入退离物资区状态。
+        } // 结束条件分支。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-    if(near_y <= far_y || far_y <= 0.0f || near_y >= 480.0f
-       || near_cm <= 0.0f || far_cm <= near_cm || bottom < far_y || bottom > near_y
-       || target.cy <= target.height / 2U || bottom >= 480.0f
-       || target.cx <= target.width / 2U
-       || (uint32_t)target.cx - target.width / 2U + target.width >= task_scene.image_width){
-        return 0;
-    }
-    k = (near_y - far_y) / (1.0f / near_cm - 1.0f / far_cm);
-    horizon = near_y - k / near_cm;
-    *distance = k / (bottom - horizon) - APP_TASK_CAMERA_FRONT_CM;
-    return *distance > 0.0f;
-}
+    case TASK_RELEASE_BACK: // 按编码器行程后退，退离后前框保持抬起。
+        result = App_Task_Move_Distance(); // 根据两轮编码器行程执行直线运动并读取动作结果。
+        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
+            App_Task_Change(TASK_NEXT_CYCLE); // 退离完成后进入预留新循环接口，尚不确认首运成功。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-// 新帧决定速度；同一帧只运行速度闭环，不反复更新锁定/死区。
-static void App_Task_Follow(void)
-{
-    int index;
-    int condition;
-    uint8_t neighbours;
-    float error;
-    float turn = 0.0f;
-    float speed = 0.0f;
-    float distance;
-    float stop_cm = target_mixed ? APP_TASK_SCATTER_STOP_CM : APP_TASK_APPROACH_STOP_CM;
-    uint32_t timeout = task_state == TASK_ALIGN ? APP_TASK_ALIGN_TIMEOUT_MS : APP_TASK_APPROACH_TIMEOUT_MS;
+    case TASK_NEXT_CYCLE: // 调用预留的下一轮搜索入口。
+        App_Task_NextCycle_Proc(); // 保持停车，等待后续补充送达确认和下一轮搜索
+        break; // 结束当前状态分支，等待下一次任务处理。
 
-    if((uint32_t)(HAL_GetTick() - task_time) >= timeout || App_Task_ReadScene() == 0
-       || (task_scene.flags & RESCUE_SCENE_TRUNCATED) != 0){
-        App_Task_Stop(); // 不沿过期/不完整图像继续开车
-        return;
-    }
-    if(task_scene.frame_id == last_frame_id && task_scene.capture_ms == last_capture_ms){
-        App_Speed_Pro();
-        return;
-    }
-    index = App_Task_MatchTarget();
-    if(index < 0){
-        App_Task_Stop(); // 丢失/无法区分时停车等待重新启动
-        return;
-    }
-    condition = App_Task_CheckTarget((uint8_t)index, &neighbours);
-    if(condition < 0 || (target_mixed == 0 && condition == 0)){
-        App_Task_Stop(); // 原本单独的目标变拥挤，不意外带动其它物块
-        return;
-    }
-    target = task_scene.objects[index];
-    last_frame_id = task_scene.frame_id;
-    last_capture_ms = task_scene.capture_ms;
-    error = App_Task_X(&target) - APP_TASK_AIM_X; // 正数：目标在右
-
-    if(task_state == TASK_APPROACH && App_Task_Abs(error) > APP_TASK_AIM_REALIGN){
-        task_state = TASK_ALIGN;
-        task_time = HAL_GetTick();
-        correcting = 1;
-    }
-    if(task_state == TASK_ALIGN){
-        if(App_Task_Abs(error) <= APP_TASK_AIM_DEAD_ENTER){
-            task_state = TASK_APPROACH;
-            task_time = HAL_GetTick();
-            correcting = 0;
-            App_Speed_Set(0.0f, 0.0f); // 先对准，下一幅新图再前进
-            return;
-        }
-    }else {
-        if(App_Task_GetDistance(&distance) == 0){
-            App_Task_Stop(); // 未标定/超出区间，不把像素当厘米
-            return;
-        }
-        if(distance <= stop_cm){
-            App_Speed_Set(0.0f, 0.0f);
-            task_state = target_mixed ? TASK_SCATTER : TASK_EXECUTE;
-            task_time = HAL_GetTick();
-            return;
-        }
-        speed = distance - stop_cm <= APP_TASK_SLOW_MARGIN_CM
-                ? APP_TASK_APPROACH_SLOW : APP_TASK_APPROACH_SPEED;
-        if(App_Task_Abs(error) <= APP_TASK_AIM_DEAD_ENTER){
-            correcting = 0;
-        }else if(App_Task_Abs(error) >= APP_TASK_AIM_DEAD_EXIT){
-            correcting = 1;
-        }
-    }
-    if(correcting != 0){
-        turn = APP_TASK_STEER_KP * error;
-        if(turn > APP_TASK_STEER_MAX){ turn = APP_TASK_STEER_MAX; }
-        if(turn < -APP_TASK_STEER_MAX){ turn = -APP_TASK_STEER_MAX; }
-        turn *= APP_TASK_STEER_SIGN;
-    }
-    App_Speed_Set(speed + turn, speed - turn);
-    App_Speed_Pro(); // 视觉直接给轮速，不同时运行原地转向角度环
-}
-
-// 分离接口占位：当前不撞、不推、不控制前框，默认停车。
-// 后续可实现低速短推 -> 后退观察；禁止抓取/抬起、推动危险物到边界/安全区。
-// RUNNING 时接口自行执行闭环；DONE 后上层重新采集新视角。
-App_Task_ScatterResult App_Task_Scatter_Proc(const RescueObject *object)
-{
-    (void)object;
-    return APP_TASK_SCATTER_WAIT;
-}
-
-void App_Task_Start(void)
-{
-    uint32_t now_ms = HAL_GetTick();
-
-    if(task_state != TASK_IDLE && task_state != TASK_EXECUTE){
-        return;
-    }
-    if(round_started != 0 && (uint32_t)(now_ms - round_time) >= APP_TASK_ROUND_TIME_MS){
-        return; // 本轮到时后不能通过按键重新计时，下一轮需复位
-    }
-    if(round_started == 0){
-        round_started = 1;
-        round_time = now_ms;
-    }
-    App_Position_Angle_Reset();
-    App_Servo_SetAngle(&servo_2, SERVO2_LIFT); // 固定搜索俯角，标定须用同一角度
-    App_Speed_Set(APP_TASK_FORWARD_SPEED, APP_TASK_FORWARD_SPEED);
-    task_time = now_ms;
-    task_state = TASK_FORWARD;
-}
-
-// 主循环先调用 Rescue_Usart2_Process()，再调用本函数；没有阻塞延时。
-void App_Task_Proc(void)
-{
-    uint32_t now_ms = HAL_GetTick();
-
-    if(round_started != 0 && (uint32_t)(now_ms - round_time) >= APP_TASK_ROUND_TIME_MS){
-        if(task_state != TASK_IDLE){ App_Task_Stop(); }
-        return;
-    }
-    switch(task_state){
-    case TASK_FORWARD:
-        if((uint32_t)(now_ms - task_time) >= APP_TASK_FORWARD_TIME_MS){
-            App_Speed_Set(0.0f, 0.0f);
-            Set_Angle_SP(APP_TASK_RIGHT_ANGLE);
-            task_time = now_ms;
-            task_state = TASK_TURN_RIGHT;
-        }else {
-            App_Speed_Pro();
-        }
-        break;
-
-    case TASK_TURN_RIGHT:
-    case TASK_TURN_LEFT:
-        App_Angle_Pro();
-        if(motor_angle_done == 1){
-            App_Position_Angle_Reset();
-            App_Task_BeginDetect(task_state == TASK_TURN_RIGHT ? TASK_DETECT_RIGHT : TASK_DETECT_LEFT);
-        }else if((uint32_t)(now_ms - task_time) >= APP_TASK_TURN_TIMEOUT_MS){
-            App_Task_Stop();
-        }
-        break;
-
-    case TASK_DETECT_RIGHT:
-    case TASK_DETECT_LEFT:
-    case TASK_RESELECT:
-        if((uint32_t)(now_ms - task_time) >= APP_TASK_DETECT_TIMEOUT_MS){
-            App_Task_Stop();
-            break;
-        }
-        if((uint32_t)(now_ms - task_time) < APP_TASK_SETTLE_TIME_MS){
-            break;
-        }
-        if(view_sent == 0 || (uint32_t)(now_ms - view_time) >= APP_TASK_VIEW_RETRY_MS){
-            view_sent = Rescue_Usart2_SendViewContext(view_id, 0);
-            view_time = now_ms;
-        }
-        if(App_Task_ReadScene() == 0 || (task_scene.flags & RESCUE_SCENE_TRUNCATED) != 0){
-            break; // 完整有效的新视角才选目标
-        }
-        if(App_Task_SelectTarget() != 0){
-            break;
-        }
-        if(task_state == TASK_DETECT_RIGHT){
-            Set_Angle_SP(APP_TASK_LEFT_ANGLE); // 右侧无合适绿色，再到左侧找
-            task_time = now_ms;
-            task_state = TASK_TURN_LEFT;
-        }else {
-            App_Task_Stop();
-        }
-        break;
-
-    case TASK_ALIGN:
-    case TASK_APPROACH:
-        App_Task_Follow();
-        break;
-
-    case TASK_SCATTER: {
-        App_Task_ScatterResult result;
-        if((uint32_t)(now_ms - task_time) >= APP_TASK_SCATTER_TIMEOUT_MS){
-            App_Task_Stop();
-            break;
-        }
-        result = App_Task_Scatter_Proc(&target);
-        if(result == APP_TASK_SCATTER_DONE){
-            App_Position_Angle_Reset();
-            App_Task_BeginDetect(TASK_RESELECT); // 动作结束不代表分离成功，必须重检
-        }else if(result == APP_TASK_SCATTER_WAIT){
-            App_Speed_Set(0.0f, 0.0f);
-        }else if(result != APP_TASK_SCATTER_RUNNING){
-            App_Task_Stop();
-        }
-        break;
-    }
-
-    case TASK_EXECUTE:
-        // 单独绿色已接近：前框动作 -> 首次单件送本队物资区 -> 确认送达，暂留空。
-        // 本版不推送/解锁其它目标，不把到达观察距离当成首运成功。
-        App_Speed_Set(0.0f, 0.0f);
-        break;
-
-    case TASK_IDLE:
-    default:
-        break;
-    }
-}
+    case TASK_IDLE: // 空闲状态与默认分支共用下方退出语句。
+    default: // 未知状态不下发新动作，结束本次状态处理。
+        break; // 结束当前状态分支，等待下一次任务处理。
+    } // 结束任务状态选择。
+} // 结束App_Task_Proc函数体。

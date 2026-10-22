@@ -9,6 +9,12 @@
 static PID_TypeDef pid_position_mid;  // 中间位置环 PID，输出基础行驶速度
 static PID_TypeDef pid_angle_yaw;     // 偏航角环 PID，输出转向修正速度
 
+// 原地转向保留连续剩余角度，避免180°附近的反馈噪声反复改变转向。
+static float turn_error;
+static float turn_last_yaw;
+static float turn_target;
+static uint8_t turn_error_valid;
+
 float motor_left_speed = 0.0f;        // 左电机速度目标，单位：cm/s
 float motor_right_speed = 0.0f;       // 右电机速度目标，单位：cm/s
 
@@ -85,6 +91,26 @@ static float App_Motor_AngleError(float target, float current)
     return App_Motor_NormalizeAngle(err);
 }
 
+// 下发新目标时只选择一次最短方向；后续按实际航向增量扣减剩余角度。
+static void App_Motor_TurnBegin(void)
+{
+    turn_target = angle_yaw_ref;
+    turn_last_yaw = angle_yaw;
+    turn_error = App_Motor_AngleError(turn_target, turn_last_yaw);
+    turn_error_valid = 1;
+}
+
+static float App_Motor_TurnError(void)
+{
+    // 兼容调试器直接修改目标值。跨越IMU的±180°时也只累计实际小角度。
+    if(!turn_error_valid || turn_target != angle_yaw_ref){
+        App_Motor_TurnBegin();
+    }
+    turn_error -= App_Motor_AngleError(angle_yaw, turn_last_yaw);
+    turn_last_yaw = angle_yaw;
+    return turn_error;
+}
+
 /*
  * @简介：根据位置误差计算基础行驶速度。
  * @参数：err 位置误差，单位：cm，正负表示行驶方向。
@@ -116,12 +142,11 @@ static float App_Motor_PositionSpeed(float err)
 /*
  * @简介：计算偏航角 PID 输出。
  * @参数：PID 角度环 PID 结构体指针。
- * @参数：FB 当前偏航角反馈值，单位：度。
+ * @参数：err 当前角度误差，单位：度；原地转向传连续误差，位置保持传最短误差。
  * @返回：角度环输出的转向速度，单位：cm/s。
  */
-static float App_Motor_PIDComputeAngle(PID_TypeDef *PID, float FB)
+static float App_Motor_PIDComputeAngle(PID_TypeDef *PID, float err)
 {
-    float err = App_Motor_AngleError(PID->SP, FB); // 当前最短角度误差
     uint32_t now_ms = HAL_GetTick();               // 当前系统时间，单位：ms
     uint64_t t_k = 0;                              // 保存本次 PID 计算时间
     uint32_t delta_ms = 0;                         // 两次计算的时间间隔，单位：ms
@@ -223,7 +248,7 @@ void App_Motor_Init(void)
 
     PID_Init(&pid_angle_yaw, 0.9f, 0.0f, 0.0f);
     /*
-     * 当前角度环使用 Kp=0.4、Ki=0、Kd=0，后续可以根据小车响应继续调参。
+     * 当前角度环使用 Kp=0.9、Ki=0、Kd=0，后续可以根据小车响应继续调参。
      */
     PID_LimitConfig(&pid_angle_yaw, 70.0f, -70.0f);
 
@@ -240,6 +265,7 @@ void App_Motor_Init(void)
 
     motor_pos_done = 1;
     motor_angle_done = 1;
+    turn_error_valid = 0;
 }
 
 /*
@@ -252,6 +278,7 @@ void App_PID_Reset(void)
     PID_Reset(&pid_position_mid);
     PID_Reset(&pid_angle_yaw);
     App_Speed_Reset();
+    turn_error_valid = 0;
 }
 
 /*
@@ -290,6 +317,8 @@ void Set_Angle_SP(float angle_ref)
     PID_ChangeSP(&pid_angle_yaw, angle_yaw_ref);
     PID_Reset(&pid_angle_yaw);
 
+    App_Motor_TurnBegin();
+
     motor_angle_done = 0;
 }
 
@@ -300,6 +329,7 @@ void Set_Angle_SP(float angle_ref)
  */
 void Set_Angle_Target(float angle_target)
 {
+    App_Update_Data();
     /*
      * 调参时直接使用上位机发送的绝对角度，不再叠加当前角度。
      * angle_yaw_target 保留发送值，用于串口输出对比；
@@ -310,6 +340,8 @@ void Set_Angle_Target(float angle_target)
 
     PID_ChangeSP(&pid_angle_yaw, angle_yaw_ref);
     PID_Reset(&pid_angle_yaw);
+
+    App_Motor_TurnBegin();
 
     motor_angle_done = 0;
 }
@@ -322,6 +354,7 @@ void Set_Angle_Target(float angle_target)
 void Set_Position_SP(float position_ref)
 {
     App_Update_Data();
+    turn_error_valid = 0;
 
     position_mid_ref = position_mid + position_ref;
     angle_yaw_ref = App_Motor_NormalizeAngle(angle_yaw);
@@ -344,6 +377,7 @@ void Set_Position_SP(float position_ref)
 void Set_Position_Angle_SP(float position_ref, float angle_ref)
 {
     App_Update_Data();
+    turn_error_valid = 0;
 
     position_mid_ref = position_mid + position_ref;
     /*
@@ -368,6 +402,12 @@ void Set_Position_Angle_SP(float position_ref, float angle_ref)
  */
 void App_Angle_Pro(void)
 {
+    App_Angle_Pro_Limited(1.0f, 0.0f);
+}
+
+// @简介：沿用角度PID；到位范围内停车，范围外的单轮速度不低于指定下限。
+void App_Angle_Pro_Limited(float tolerance_deg, float min_speed)
+{
     App_Update_Data();
     PERIODIC_START(ANGLE,15)
 
@@ -376,21 +416,20 @@ void App_Angle_Pro(void)
      * 都同步到 PID 的设定值，确保实际计算使用最新目标角度。
      */
     PID_ChangeSP(&pid_angle_yaw, angle_yaw_ref);
+    float err = App_Motor_TurnError();
 
-    if(App_Motor_Abs(App_Motor_AngleError(angle_yaw_ref, angle_yaw)) <= 1.0f){
+    if(App_Motor_Abs(err) <= tolerance_deg){
         motor_angle_done = 1;
         motor_turn_speed = 0.0f;
         App_Speed_Set(0.0f, 0.0f);
         PID_Reset(&pid_angle_yaw);
     }else {
         motor_angle_done = 0;
-        motor_turn_speed = App_Motor_PIDComputeAngle(&pid_angle_yaw, angle_yaw);
+        motor_turn_speed = App_Motor_PIDComputeAngle(&pid_angle_yaw, err);
 
-        // if(motor_turn_speed > 0.0f && motor_turn_speed < 10.0f){
-        //     motor_turn_speed = 10.0f;
-        // }else if(motor_turn_speed < 0.0f && motor_turn_speed > -10.0f){
-        //     motor_turn_speed = -10.0f;
-        // }
+        if(App_Motor_Abs(motor_turn_speed) < min_speed){
+            motor_turn_speed = err > 0.0f ? min_speed : -min_speed;
+        }
 
         App_Speed_Set(-motor_turn_speed, +motor_turn_speed);
     }
@@ -436,7 +475,8 @@ void App_Position_Pro(void)
             motor_turn_speed = 0.0f;
         }else {
             motor_angle_done = 0;
-            motor_turn_speed = App_Motor_PIDComputeAngle(&pid_angle_yaw, angle_yaw);
+            motor_turn_speed = App_Motor_PIDComputeAngle(&pid_angle_yaw,
+                                  App_Motor_AngleError(angle_yaw_ref, angle_yaw));
         }
 
         motor_left_speed = motor_base_speed - motor_turn_speed;

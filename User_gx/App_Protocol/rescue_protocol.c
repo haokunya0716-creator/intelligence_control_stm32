@@ -60,12 +60,21 @@ uint8_t Rescue_DecodeScene(const RescueFrame *frame, RescueScene *out)
 {
     RescueScene scene = {0};
     uint8_t i;
+    uint8_t header_size;
+    uint8_t object_size;
+    uint8_t max_objects;
 
     if (frame == NULL || out == NULL ||
-        frame->command != RESCUE_CMD_OBSERVATIONS ||
-        frame->length < RESCUE_SCENE_HEADER_SIZE) {
+        (frame->command != RESCUE_CMD_OBSERVATIONS &&
+         frame->command != RESCUE_CMD_OBSERVATIONS_EXT)) {
         return 0U;
     }
+    scene.has_source_age = frame->command == RESCUE_CMD_OBSERVATIONS_EXT;
+    header_size = scene.has_source_age ? RESCUE_EXT_HEADER_SIZE : RESCUE_SCENE_HEADER_SIZE;
+    object_size = scene.has_source_age ? RESCUE_EXT_OBJECT_SIZE : RESCUE_OBJECT_WIRE_SIZE;
+    max_objects = scene.has_source_age ? RESCUE_EXT_MAX_OBJECTS : RESCUE_MAX_OBJECTS;
+    if (frame->length < header_size) { return 0U; }
+    if (scene.has_source_age) { scene.source_age_ms = Rescue_ReadU16(frame->payload + 14); }
     scene.frame_id = Rescue_ReadU16(frame->payload);
     scene.capture_ms = Rescue_ReadU32(frame->payload + 2);
     scene.view_id = Rescue_ReadU16(frame->payload + 6);
@@ -73,9 +82,8 @@ uint8_t Rescue_DecodeScene(const RescueFrame *frame, RescueScene *out)
     scene.image_height = Rescue_ReadU16(frame->payload + 10);
     scene.flags = frame->payload[12];
     scene.object_count = frame->payload[13];
-    if (scene.object_count > RESCUE_MAX_OBJECTS ||
-        frame->length != RESCUE_SCENE_HEADER_SIZE +
-                         scene.object_count * RESCUE_OBJECT_WIRE_SIZE ||
+    if (scene.object_count > max_objects ||
+        frame->length != header_size + scene.object_count * object_size ||
         scene.image_width == 0U || scene.image_height == 0U ||
         (scene.flags & ~(RESCUE_SCENE_IMAGE_VALID | RESCUE_SCENE_TRUNCATED)) != 0U ||
         ((scene.flags & RESCUE_SCENE_IMAGE_VALID) == 0U &&
@@ -83,8 +91,7 @@ uint8_t Rescue_DecodeScene(const RescueFrame *frame, RescueScene *out)
         return 0U;
     }
     for (i = 0U; i < scene.object_count; ++i) {
-        const uint8_t *data = frame->payload + RESCUE_SCENE_HEADER_SIZE +
-                              i * RESCUE_OBJECT_WIRE_SIZE;
+        const uint8_t *data = frame->payload + header_size + i * object_size;
         RescueObject *object = &scene.objects[i];
         object->type = data[0];
         object->confidence = data[1];
@@ -92,6 +99,14 @@ uint8_t Rescue_DecodeScene(const RescueFrame *frame, RescueScene *out)
         object->cy = Rescue_ReadU16(data + 4);
         object->width = Rescue_ReadU16(data + 6);
         object->height = Rescue_ReadU16(data + 8);
+        if (scene.has_source_age) { object->track_id = Rescue_ReadU16(data + 10); }
+        /* 非零ID在本帧必须唯一；重复ID不能作为重识别原目标的依据。 */
+        if (object->track_id != 0U) {
+            uint8_t j;
+            for (j = 0U; j < i; ++j) {
+                if (scene.objects[j].track_id == object->track_id) { return 0U; }
+            }
+        }
         /* 中心定义为 xmin + width/2（整数向下取整），框须在图像内。 */
         if (object->type > RESCUE_OBJECT_BLUE_CASUALTY_ZONE || object->confidence > 100U ||
             object->width == 0U || object->height == 0U ||

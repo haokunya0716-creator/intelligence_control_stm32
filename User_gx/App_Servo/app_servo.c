@@ -32,7 +32,7 @@ void App_Servo_Init(void) {
 
     /* 先加载两路初始脉宽，再开启输出，避免先输出零脉宽。 */
     App_Servo_SetAngle(&servo_1, 180.0f);
-    App_Servo_SetAngle(&servo_2, 75.0f);
+    App_Servo_SetAngle(&servo_2, 45.0f);
 
     HAL_TIM_PWM_Start(servo_1.htim, servo_1.Channel);
     HAL_TIM_PWM_Start(servo_2.htim, servo_2.Channel);
@@ -62,7 +62,7 @@ void App_Servo_SetAngle(Servo_t *servo, float angle) {
 
     ccr = Servo_angle_Compute(angle);
     __HAL_TIM_SET_COMPARE(servo->htim, servo->Channel, ccr);
-    servo->Angle = angle; // 上电初始化也经过本接口，两路初始保存值均为 180°
+    servo->Angle = angle; // 上电初始化也经过本接口：前框180°、摄像头75°。
 }
 
 static uint32_t Servo_angle_Compute(float angle_target) {

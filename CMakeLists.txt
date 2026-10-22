@@ -84,6 +84,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         User_gx/App_Servo/app_servo.c
         User_gx/App_Servo/app_servo.h
 
+        User_gx/App_LinePID/app_line_pid.c
+        User_gx/App_LinePID/app_line_pid.h
+
         User_gx/App_Protocol/rescue_protocol.c
         User_gx/App_Protocol/rescue_usart2.c
 
@@ -91,6 +94,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         MyLib/DRV8701/drv8701.h
         App_Task/App_Task.c
         App_Task/App_Task.h
+        App_Task/app_task_config.h
+        App_Task/app_task_move.c
+        App_Task/app_task_vision.c
+        App_Task/app_task_scatter.c
+
 
         User_gx/Oled_ssd/oled_hardware_i2c.c
         User_gx/Oled_ssd/oled_hardware_i2c.h
@@ -104,6 +112,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         User_gx
         User_gx/Inc
         User_gx/Src
+        User_gx/App_LinePID
         User_gx/App_Motor
         User_gx/App_Servo
         User_gx/App_Protocol
@@ -113,6 +122,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         MyLib/DRV8701
         App_Task
          User_gx/Oled_ssd
+
 )
 
 # Add project symbols (macros)
