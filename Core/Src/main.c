@@ -43,6 +43,7 @@
 #include "app_task_config.h"
 #include "oled_hardware_i2c.h"
 #include <stdio.h>
+#include "app_cargo_test.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -260,6 +261,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     /* USART2 的组帧和缓存由协议模块负责；这里不执行电机或舵机动作。 */
     extern void Rescue_Usart2_RxCallback(void);
     Rescue_Usart2_RxCallback();
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART2) {
+    /* ORE 等阻塞错误会结束 HAL 接收；协议模块清掉残帧并重新挂接收。 */
+    Rescue_Usart2_ErrorCallback();
   }
 }
 /* USER CODE END 4 */

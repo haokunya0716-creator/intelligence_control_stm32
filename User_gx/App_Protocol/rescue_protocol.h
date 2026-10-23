@@ -51,7 +51,8 @@ typedef enum {
     RESCUE_OBJECT_RED_SUPPLY_ZONE = 10,    /* 红方物资放置区 */
     RESCUE_OBJECT_RED_CASUALTY_ZONE = 11,  /* 红方伤员放置区 */
     RESCUE_OBJECT_BLUE_SUPPLY_ZONE = 12,   /* 蓝方物资放置区 */
-    RESCUE_OBJECT_BLUE_CASUALTY_ZONE = 13  /* 蓝方伤员放置区 */
+    RESCUE_OBJECT_BLUE_CASUALTY_ZONE = 13, /* 蓝方伤员放置区 */
+    RESCUE_OBJECT_SAFE_ZONE_DIVIDER = 14  /* 安全区中间黑色分割线 */
 } RescueObjectType;
 
 #define RESCUE_SCENE_IMAGE_VALID  0x01U

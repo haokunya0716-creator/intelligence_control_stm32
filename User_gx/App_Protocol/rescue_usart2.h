@@ -15,6 +15,9 @@ uint8_t Rescue_Usart2_Start(void);
 /* 只在 HAL_UART_RxCpltCallback() 的 USART2 分支中调用。 */
 void Rescue_Usart2_RxCallback(void);
 
+/* 只在 HAL_UART_ErrorCallback() 的 USART2 分支中调用；丢弃残帧并恢复接收。 */
+void Rescue_Usart2_ErrorCallback(void);
+
 /*
  * 主循环每次迭代都调用：处理视觉帧并更新最新场景缓存。
  * 不执行动作、不运行闭环、不发送逐帧 ACK；动作由 STM32 业务层决定。

@@ -108,7 +108,7 @@ uint8_t Rescue_DecodeScene(const RescueFrame *frame, RescueScene *out)
             }
         }
         /* 中心定义为 xmin + width/2（整数向下取整），框须在图像内。 */
-        if (object->type > RESCUE_OBJECT_BLUE_CASUALTY_ZONE || object->confidence > 100U ||
+        if (object->type > RESCUE_OBJECT_SAFE_ZONE_DIVIDER || object->confidence > 100U ||
             object->width == 0U || object->height == 0U ||
             object->width > scene.image_width || object->height > scene.image_height ||
             object->cx < object->width / 2U || object->cy < object->height / 2U ||

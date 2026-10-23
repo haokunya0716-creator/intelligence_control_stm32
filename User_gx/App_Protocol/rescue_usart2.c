@@ -117,6 +117,19 @@ void Rescue_Usart2_RxCallback(void)
     count++;
 }
 
+/* UART 错误可能终止 HAL 接收；丢弃不完整帧后立即尝试恢复。 */
+void Rescue_Usart2_ErrorCallback(void)
+{
+    HAL_StatusTypeDef status;
+
+    Rescue_ParserInit(&parser);
+    rx_active = 0U;
+    status = HAL_UART_Receive_IT(&huart2, &rx_byte, 1U);
+    if (status == HAL_OK || huart2.RxState != HAL_UART_STATE_READY) {
+        rx_active = 1U;
+    }
+}
+
 static uint8_t Rescue_Usart2_Pop(RescueReceivedFrame *out)
 {
     uint32_t irq_state = __get_PRIMASK();

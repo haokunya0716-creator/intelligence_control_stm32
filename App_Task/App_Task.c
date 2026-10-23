@@ -11,19 +11,13 @@
 typedef enum { // 定义任务状态枚举，状态机按下列步骤组织运行。
     TASK_IDLE = 0,    // 停车等待按键
     TASK_FORWARD,     // 启动直行
-    TASK_TURN_RIGHT, // 保留原状态编号；当前启动流程不再执行固定右转。
-    TASK_TURN_LEFT, // 保留原状态编号；当前启动流程不再执行180度换向。
-    TASK_SEARCH_SPIN, // 启动直行后持续原地旋转，并在旋转中搜索目标。
-    TASK_DETECT_LEFT, // 保留原状态编号；当前搜索不再分左右两侧。
-    TASK_RESELECT,    // 撞散结束后重新观察
+    TASK_SEARCH_SPIN = 4, // 启动直行后持续顺时针旋转找绿色，沿用原4号搜索日志。
+    TASK_RESELECT = 6, // 撞散结束后重新观察，保留原状态编号。
     TASK_FOLLOW,      // 首次对准+视觉PID接近，细节由视觉模块执行
     TASK_SCATTER,     // 额外前推+限时原地旋转
-    TASK_FRAME_DROP, // 等待一号前框落下后再低头复检。
-    TASK_CAMERA_DROP, // 等待二号摄像头转到低头角度。
-    TASK_VERIFY,      // 低头复检框内恰好一个绿色
-    TASK_CAMERA_LIFT, // 等待摄像头恢复正常观察角。
-    TASK_CAPTURE_BACK, // 复检通过后按编码器行程后退。
-    TASK_ZONE_SEARCH, // 原地寻找本队物资放置区。
+    TASK_FRAME_DROP, // 等待一号前框落下后直接复检，摄像头保持正常角度。
+    TASK_VERIFY = 11, // 三张新图中至少一张单绿色合格；保留原日志编号，删除原10号摄像头低头等待。
+    TASK_ZONE_SEARCH = 14, // 复检通过直接原地寻找本队物资放置区，保留原状态编号。
     TASK_ZONE_FOLLOW, // 对准并接近锁定的本队物资放置区。
     TASK_FRAME_LIFT, // 到达物资区停车门限后等待前框抬起。
     TASK_RELEASE_BACK, // 抬框后按编码器行程退离物资区。
@@ -47,16 +41,22 @@ static void App_Task_Change(App_Task_State state) // 函数入口：切换任务
 } // 结束App_Task_Change函数体。
 
 // @简介：结束本次任务并停车；不清除落框标志，异常载物需人工处理后复位。
-static void App_Task_Stop(void) // 函数入口：结束本次任务并停车；不清除落框标志，异常载物需人工处理后复位。
-{ // 开始App_Task_Stop函数体。
-    App_Task_Move_Stop(); // 撤销位置/角度控制并将左右轮目标速度置零。
-    App_Task_Change(TASK_IDLE); // 回到空闲等待状态，保留载物锁和整轮起点。
-} // 结束App_Task_Stop函数体。
+static void App_Task_Stop(const char *reason) // 先停车，再打印退出原因及原状态，最后回到空闲。
+{
+    uint32_t now_ms = HAL_GetTick(); // 保存打印前的时间，避免串口耗时改变本次现场记录。
+    App_Task_Move_Stop(); // 先撤销运动，不让失败打印延后停车。
+    if(APP_TASK_DEBUG_ENABLE){
+        App_USART1_Printf("[TASK] stop=%s state=%u dt=%lu round=%lu\r\n", reason, (unsigned int)task_state,
+                         (unsigned long)(now_ms - task_time),
+                         (unsigned long)(round_started ? now_ms - round_time : 0U));
+    }
+    App_Task_Change(TASK_IDLE); // 保留载物锁及整轮起点。
+}
 
 // @简介：停车后开始正常俯角的新视角检测；旧图像不能用于撞散后重选或搜索物资区。
 static void App_Task_BeginDetect(App_Task_State state) // 函数入口：停车后开始正常俯角的新视角检测；旧图像不能用于撞散后重选或搜索物资区。
 { // 开始App_Task_BeginDetect函数体。
-    App_Task_Vision_Begin(SERVO2_LIFT); // 以正常俯角开始新视角，排除上一阶段迟到图像。
+    App_Task_Vision_Begin(SERVO2_LIFT, state == TASK_RESELECT ? APP_TASK_SETTLE_TIME_MS : 0U); // 仅撞散重选等待画面稳定；启动旋转和物资区搜索立即发新视角。
     App_Task_Change(state); // 切换到指定检测状态，并记录本步骤起点。
 } // 结束App_Task_BeginDetect函数体。
 
@@ -64,9 +64,18 @@ static void App_Task_BeginDetect(App_Task_State state) // 函数入口：停车�
 void App_Task_Start(uint8_t team) // 函数入口：空闲且未落框时选择队伍并启动；整轮三分钟计时只在第一次启动时开始。
 { // 开始App_Task_Start函数体。
     uint32_t now_ms = HAL_GetTick(); // 读取当前毫秒计时，作为本次处理的时间基准。
-    if(task_state != TASK_IDLE || cargo_pending != 0 // 非空闲或已经落框时拒绝重启，继续检查队伍是否合法。
-       || (team != APP_TASK_TEAM_RED && team != APP_TASK_TEAM_BLUE)){ return; } // 队伍参数也必须为红方或蓝方，否则立即返回。
-    if(round_started != 0 && (uint32_t)(now_ms - round_time) >= APP_TASK_ROUND_TIME_MS){ return; } // 本轮已经开始且达到总时限时禁止重新启动。
+    const char *reject = 0; // 只记录原有拒绝条件，不新增启动限制。
+    if(task_state != TASK_IDLE){ reject = "busy"; }
+    else if(cargo_pending != 0){ reject = "cargo_pending"; }
+    else if(team != APP_TASK_TEAM_RED && team != APP_TASK_TEAM_BLUE){ reject = "invalid_team"; }
+    else if(round_started != 0 && (uint32_t)(now_ms - round_time) >= APP_TASK_ROUND_TIME_MS){ reject = "round_timeout"; }
+    if(reject != 0){
+        if(APP_TASK_DEBUG_ENABLE){
+            App_USART1_Printf("[TASK] reject=%s state=%u team=%u cargo=%u\r\n",
+                             reject, (unsigned int)task_state, (unsigned int)team, (unsigned int)cargo_pending);
+        }
+        return;
+    }
     if(round_started == 0){ // 仅第一次接受启动时建立整轮计时起点。
         round_started = 1; // 标记整轮已启动，后续重试不再重置起点。
         round_time = now_ms; // 保存本轮首次启动的毫秒时间。
@@ -86,36 +95,34 @@ void App_Task_Proc(void) // 函数入口：非阻塞执行小车任务；只写�
     App_Task_Result result; // 保存子动作的运行、等待、完成或失败结果。
     uint32_t elapsed = (uint32_t)(HAL_GetTick() - task_time); // 用无符号时间差计算当前步骤已经持续的毫秒数。
     if(round_started != 0 && (uint32_t)(HAL_GetTick() - round_time) >= APP_TASK_ROUND_TIME_MS){ // 整轮到达运行时限时，优先停止当前任务。
-        if(task_state != TASK_IDLE){ App_Task_Stop(); } // 若仍有任务在运行则停车并回到空闲状态。
+        if(task_state != TASK_IDLE){ App_Task_Stop("round_timeout"); } // 若仍有任务在运行则停车并回到空闲状态。
         return; // 结束本次调用，不再执行后续语句。
     } // 结束条件分支。
     switch(task_state){ // 根据当前状态执行一个非阻塞步骤。
     case TASK_FORWARD: // 处理启动后的定时直行。
         if(elapsed >= APP_TASK_FORWARD_TIME_MS){ // 直行时间达到宏定义门限后开始旋转搜索。
-            App_Task_BeginDetect(TASK_SEARCH_SPIN); // 停车并建立正常观察新视角，搜索状态随后开始旋转。
+            App_Task_BeginDetect(TASK_SEARCH_SPIN); // 立即建立新视角，进入持续顺时针搜索，不再先右转再换向。
+            App_Task_Move_Speed(APP_TASK_ZONE_SPIN_SPEED, -APP_TASK_ZONE_SPIN_SPEED); // 与寻找本队物资区共用轮速，左正右负顺时针旋转。
         }else { // 前述条件不满足时执行此分支。
             App_Task_Move_Proc(); // 维持当前目标轮速，继续执行左右轮速度闭环。
         } // 结束其它情况分支。
         break; // 结束当前状态分支，等待下一次任务处理。
 
-    case TASK_SEARCH_SPIN: { // 在原地持续旋转，并持续使用新图像搜索可跟踪目标。
-        int selected = App_Task_Vision_Select(); // 检查当前视角的有效新图像并尝试锁定绿色或可撞散物资目标。
-        if(selected > 0){ // 锁定成功后立即停止旋转，避免目标进入跟随时底盘仍在转动。
-            App_Task_Move_Stop(); // 撤销旋转速度并停车，视觉跟随从静止底盘开始。
-            App_Task_Change(TASK_FOLLOW); // 切换到首次横向对准和后续视觉跟踪。
-        }else { // 尚未锁定目标时继续缓慢原地旋转，等待相机看到合格目标。
-            App_Task_Move_Speed(APP_TASK_SEARCH_SPIN_SPEED, -APP_TASK_SEARCH_SPIN_SPEED); // 左轮前进、右轮后退，按配置速度顺时针搜索。
-        } // 结束目标锁定与持续搜索分支。
+    case TASK_SEARCH_SPIN: // 持续顺时针旋转，边转边用当前视角新图选择绿色优先的目标。
+        if(App_Task_Vision_Select() > 0){ // 成功锁定合格目标后停止搜索旋转，交给原跟随流程。
+            App_Task_Move_Stop(); // 进入首次对准前清除搜索轮速，避免继续沿用旋转命令。
+            App_Task_Change(TASK_FOLLOW); // 切换到首次对准和视觉差速接近状态。
+        }else { // 尚无合格目标或正在等待新图时继续顺时针旋转。
+            App_Task_Move_Speed(APP_TASK_ZONE_SPIN_SPEED, -APP_TASK_ZONE_SPIN_SPEED); // 共用物资区搜索轮速，不受原两侧2秒/三张空图结束条件限制。
+        } // 结束其它情况分支。
         break; // 结束当前状态分支，等待下一次任务处理。
-    } // 结束原地搜索状态。
+
     case TASK_RESELECT: { // 处理撞散后的重选，并为局部变量建立作用域。
         int selected; // 保存目标选择结果：正数已锁定、零无候选、负数继续等待。
-        selected = elapsed >= APP_TASK_DETECT_TIMEOUT_MS ? 0 : App_Task_Vision_Select(); // 撞散后重选限时检查，其它时候按当前有效新图选目标。
+        selected = elapsed >= APP_TASK_DETECT_TIMEOUT_MS ? 0 : App_Task_Vision_Select(); // 撞散重选超时视为无候选，否则按当前有效新图尝试选择目标。
         if(selected > 0){ // 成功锁定合格目标时进入跟随流程。
             App_Task_Change(TASK_FOLLOW); // 切换到首次对准和视觉差速接近状态。
-        }else if(selected == 0){ // 连续有效新帧无候选或检测超时，处理本侧无目标的情况。
-            App_Task_Stop(); // 撞散后重选超时仍无目标时停车结束。
-        } // 结束条件分支。
+        }else if(selected == 0){ App_Task_Vision_LogDetails("SELECT"); App_Task_Stop(elapsed >= APP_TASK_DETECT_TIMEOUT_MS ? "reselect_timeout" : "reselect_empty"); } // 撞散重选连续有效新帧无候选或超时仍停车结束。
         break; // 结束当前状态分支，等待下一次任务处理。
     } // 结束检测状态局部作用域。
 
@@ -130,59 +137,36 @@ void App_Task_Proc(void) // 函数入口：非阻塞执行小车任务；只写�
                 App_Task_Frame_Set(1); // 单独绿色走到停车位置后才落框
                 App_Task_Change(TASK_FRAME_DROP); // 进入前框落下后的机械等待阶段。
             } // 结束其它情况分支。
-        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop("follow_failed"); } // 子动作失败时统一停车，停止后续任务。
         break; // 结束当前状态分支，等待下一次任务处理。
 
     case TASK_SCATTER: // 处理额外前推和原地旋转。
         result = App_Task_Scatter_Proc(); // 非阻塞执行撞散子动作并取得其当前结果。
         if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
             App_Task_BeginDetect(TASK_RESELECT); // 动作结束不等于撞散成功，重新选目标
-        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop("scatter_failed"); } // 子动作失败时统一停车，停止后续任务。
         break; // 结束当前状态分支，等待下一次任务处理。
 
-    case TASK_FRAME_DROP: // 等待前框落下稳定，再改变摄像头角度。
+    case TASK_FRAME_DROP: // 等待前框落下稳定后直接复检，摄像头不动作、不额外等待。
         if(elapsed >= APP_TASK_SERVO_WAIT_MS){ // 舵机设定角发出后，等待配置的机械稳定时间。
-            App_Task_Camera_Set(1); // 命令摄像头低头观察前框内物体。
-            App_Task_Change(TASK_CAMERA_DROP); // 转入摄像头低头机械等待阶段。
+            App_Task_Vision_Begin(SERVO2_LIFT, 0U); // 立即发送复检新视角编号，排除落框前旧图，不再等待200ms。
+            App_Task_Change(TASK_VERIFY); // 进入三张新图的框内单绿色复检状态。
         } // 结束条件分支。
         break; // 结束当前状态分支，等待下一次任务处理。
 
-    case TASK_CAMERA_DROP: // 等待摄像头低头稳定后开始复检视角。
-        if(elapsed >= APP_TASK_SERVO_WAIT_MS){ // 舵机设定角发出后，等待配置的机械稳定时间。
-            App_Task_Vision_Begin(SERVO2_DROP); // 以低头俯角建立新的视角编号，拒绝正常俯角的旧图。
-            App_Task_Change(TASK_VERIFY); // 进入框内单绿色复检状态。
-        } // 结束条件分支。
-        break; // 结束当前状态分支，等待下一次任务处理。
-
-    case TASK_VERIFY: // 检查前框内是否连续新帧恰好一个完整绿色。
-        if(elapsed >= APP_TASK_VERIFY_TIMEOUT_MS){ App_Task_Stop(); break; } // 复检超过允许时间则停车并退出当前状态处理。
-        result = App_Task_Vision_Verify(); // 执行一次框内实体数量、类型和完整性复检。
+    case TASK_VERIFY: // 收齐三张有效新图后，至少一张区域内恰好一个可信绿色才通过。
+        if(elapsed >= APP_TASK_VERIFY_TIMEOUT_MS){ App_Task_Vision_LogDetails("VERIFY"); App_Task_Stop("verify_timeout"); break; } // 复检超过允许时间则停车并退出当前状态处理。
+        result = App_Task_Vision_Verify(); // 按中心坐标执行框内实体数量、类型和置信度复检。
         if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
-            App_Task_Camera_Set(0); // 命令摄像头恢复正常观察角度。
-            App_Task_Change(TASK_CAMERA_LIFT); // 复检通过后等待摄像头恢复正常观察角。
-        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+            App_Task_BeginDetect(TASK_ZONE_SEARCH); // 复检通过立即发新视角寻找本队物资区，不再后退或等待200ms。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop("verify_failed"); } // 子动作失败时统一停车，停止后续任务。
         break; // 结束当前状态分支，等待下一次任务处理。
 
-    case TASK_CAMERA_LIFT: // 等待摄像头抬起稳定，再开始短距离后退。
-        if(elapsed >= APP_TASK_SERVO_WAIT_MS){ // 舵机设定角发出后，等待配置的机械稳定时间。
-            App_Task_Move_Start(-APP_TASK_CAPTURE_BACK_CM, APP_TASK_BACK_SPEED); // 按配置轮速启动短距离后退；负距离表示后退。
-            App_Task_Change(TASK_CAPTURE_BACK); // 进入复检后退状态，等待两轮均达到行程。
-        } // 结束条件分支。
-        break; // 结束当前状态分支，等待下一次任务处理。
-
-    case TASK_CAPTURE_BACK: // 处理复检通过后的编码器后退。
-        result = App_Task_Move_Distance(); // 根据两轮编码器行程执行直线运动并读取动作结果。
-        if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
-            App_Task_BeginDetect(TASK_ZONE_SEARCH); // 后退完成后开始正常新视角，准备寻找本队物资区。
-        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
-        break; // 结束当前状态分支，等待下一次任务处理。
-
-    case TASK_ZONE_SEARCH: // 限时原地寻找本队物资放置分区。
-        if(elapsed >= APP_TASK_ZONE_SEARCH_MS){ App_Task_Stop(); break; } // 物资区搜索超时则停车并退出当前状态。
+    case TASK_ZONE_SEARCH: // 持续寻找本队物资区，直到找到或整轮到时。
         result = App_Task_Vision_SearchZone(); // 旋转搜索唯一可信的本队物资分区，找到后锁定并停车。
         if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
             App_Task_Change(TASK_ZONE_FOLLOW); // 进入物资区首次对准及差速接近状态。
-        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop("zone_search_failed"); } // 子动作失败时统一停车，停止后续任务。
         break; // 结束当前状态分支，等待下一次任务处理。
 
     case TASK_ZONE_FOLLOW: // 对准并接近已锁定的本队物资分区。
@@ -190,7 +174,9 @@ void App_Task_Proc(void) // 函数入口：非阻塞执行小车任务；只写�
         if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
             App_Task_Frame_Set(0); // 到达物资区停车门限后抬框，退离后保持抬起
             App_Task_Change(TASK_FRAME_LIFT); // 进入抬框机械等待阶段，等待完成后才退离。
-        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        }else if(result == APP_STEP_RESEARCH){
+            App_Task_Change(TASK_ZONE_SEARCH); // 视觉层本次调用已开始旋转，直接切回搜索，不换视角/不固定等待。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop("zone_follow_failed"); } // 子动作失败时统一停车，停止后续任务。
         break; // 结束当前状态分支，等待下一次任务处理。
 
     case TASK_FRAME_LIFT: // 等待前框抬起稳定后再后退。
@@ -204,7 +190,7 @@ void App_Task_Proc(void) // 函数入口：非阻塞执行小车任务；只写�
         result = App_Task_Move_Distance(); // 根据两轮编码器行程执行直线运动并读取动作结果。
         if(result == APP_STEP_DONE){ // 本步骤完成时进入后续动作分支。
             App_Task_Change(TASK_NEXT_CYCLE); // 退离完成后进入预留新循环接口，尚不确认首运成功。
-        }else if(result == APP_STEP_FAILED){ App_Task_Stop(); } // 子动作失败时统一停车，停止后续任务。
+        }else if(result == APP_STEP_FAILED){ App_Task_Stop("release_back_failed"); } // 子动作失败时统一停车，停止后续任务。
         break; // 结束当前状态分支，等待下一次任务处理。
 
     case TASK_NEXT_CYCLE: // 调用预留的下一轮搜索入口。

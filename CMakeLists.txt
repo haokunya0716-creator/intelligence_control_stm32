@@ -97,6 +97,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         App_Task/app_task_config.h
         App_Task/app_task_move.c
         App_Task/app_task_vision.c
+        App_Task/app_task_zone.c
         App_Task/app_task_scatter.c
 
 

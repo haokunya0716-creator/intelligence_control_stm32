@@ -19,6 +19,10 @@ cmake-build-release/
 *.d
 *.lst
 
+# Python 运行缓存
+__pycache__/
+*.py[cod]
+
 # 操作系统杂物
 .DS_Store
 Thumbs.db
